@@ -130,9 +130,23 @@ function analyzeMarket(ohlcv) {
     // Get latest values
     const latestIndex = ohlcv.length - 1;
     const price = closes[latestIndex];
-    const ema20Value = ema20[ema20.length - 1];
-    const rsiValue = rsi[rsi.length - 1];
-    const atrValue = atr[atr.length - 1];
+    const ema20Value = ema20.length > 0 ? ema20[ema20.length - 1] : undefined;
+    const rsiValue = rsi.length > 0 ? rsi[rsi.length - 1] : undefined;
+    const atrValue = atr.length > 0 ? atr[atr.length - 1] : undefined;
+    
+    // Validate that all values are valid numbers
+    if (typeof price !== 'number' || isNaN(price) || price <= 0) {
+        return null;
+    }
+    if (typeof ema20Value !== 'number' || isNaN(ema20Value) || ema20Value <= 0) {
+        return null;
+    }
+    if (typeof rsiValue !== 'number' || isNaN(rsiValue) || rsiValue < 0 || rsiValue > 100) {
+        return null;
+    }
+    if (typeof atrValue !== 'number' || isNaN(atrValue) || atrValue <= 0) {
+        return null;
+    }
     
     return {
         price,
@@ -380,20 +394,30 @@ while (true) {
                 if (price <= trailingStopPrice) {
                     console.log(`🚨 STOP LOSS TRIGGERED at $${price.toFixed(2)}`);
                     
+                    let orderSucceeded = false;
+                    
                     if (enableTrading) {
                         try {
                             const order = await exchange.createMarketSellOrder(symbol, positionAmount);
                             console.log(`✅ Sell order executed: ${order.id || 'N/A'}`);
+                            orderSucceeded = true;
                         } catch (e) {
                             console.log(`❌ Sell order failed: ${e.message}`);
+                            // Don't reset position state if order failed - keep trying
+                            await sleep(60000);
+                            continue;
                         }
                     } else {
                         console.log(`   (Simulated - use --execute to enable real trading)`);
+                        orderSucceeded = true; // In simulation mode, consider it successful
                     }
                     
-                    inPosition = false;
-                    trailingStopPrice = 0.0;
-                    positionAmount = 0.0;
+                    // Only reset position state if order succeeded (or simulated)
+                    if (orderSucceeded) {
+                        inPosition = false;
+                        trailingStopPrice = 0.0;
+                        positionAmount = 0.0;
+                    }
                 }
             }
         }
