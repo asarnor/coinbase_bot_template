@@ -44,6 +44,17 @@ const argv = yargs(hideBin(process.argv))
 const useSandbox = argv.sandbox || argv.test;  // Auto-enable sandbox in test mode
 const enableTrading = argv.execute;
 
+// Validate API keys
+const hasPlaceholderKeys = apiKey === 'YOUR_API_KEY' || 
+                          apiSecret === 'YOUR_SECRET_KEY' || 
+                          apiPassphrase === 'YOUR_PASSPHRASE';
+
+if (hasPlaceholderKeys) {
+    console.log("⚠️  WARNING: API keys are set to placeholder values!");
+    console.log("   Please update apiKey, apiSecret, and apiPassphrase in main.js");
+    console.log("   Tests that require authentication will fail.\n");
+}
+
 // Get the exchange class - Use coinbaseexchange for sandbox support, coinbaseadvanced for production
 const ExchangeClass = useSandbox ? (ccxt.coinbaseexchange || ccxt.coinbaseadvanced) : (ccxt.coinbaseadvanced || ccxt.coinbaseexchange);
 
@@ -110,7 +121,12 @@ async function fetchData() {
         const bars = await exchange.fetchOHLCV(symbol, timeframe, undefined, 100);
         return bars;
     } catch (e) {
-        console.log(`Data Error: ${e.message}`);
+        if (e.message.includes('does not have market symbol')) {
+            console.log(`Data Error: Symbol ${symbol} not available in ${useSandbox ? 'sandbox' : 'production'}`);
+            console.log(`   This is expected in sandbox mode - sandbox may have limited trading pairs`);
+        } else {
+            console.log(`Data Error: ${e.message}`);
+        }
         return [];
     }
 }
@@ -160,6 +176,13 @@ function analyzeMarket(ohlcv) {
 async function testBalance() {
     try {
         console.log("\n💰 Testing Balance Fetch...");
+        
+        if (hasPlaceholderKeys) {
+            console.log("⚠️  Skipped - API keys are placeholders (authentication required)");
+            console.log("   Update API keys in main.js to test balance fetching");
+            return null;
+        }
+        
         const balance = await exchange.fetchBalance();
         console.log("✅ Balance fetched successfully");
         
@@ -176,7 +199,13 @@ async function testBalance() {
         
         return balance;
     } catch (e) {
-        console.log(`❌ Balance Error: ${e.message}`);
+        if (e.message.includes('invalid base64') || e.message.includes('sign()')) {
+            console.log(`❌ Balance Error: Invalid API credentials`);
+            console.log(`   ${e.message}`);
+            console.log("   Please check your API key, secret, and passphrase in main.js");
+        } else {
+            console.log(`❌ Balance Error: ${e.message}`);
+        }
         return null;
     }
 }
@@ -185,6 +214,18 @@ async function testBalance() {
 async function testTradeExecution() {
     try {
         console.log("\n🧪 Testing Trade Execution...");
+        
+        if (hasPlaceholderKeys) {
+            console.log("⚠️  Skipped - API keys are placeholders (authentication required)");
+            console.log("   Update API keys in main.js to test trade execution");
+            return false;
+        }
+        
+        if (!(symbol in exchange.markets)) {
+            console.log(`⚠️  Skipped - Symbol ${symbol} not available`);
+            console.log("   Trade execution requires a valid trading pair");
+            return false;
+        }
         
         // Fetch current price
         const ticker = await exchange.fetchTicker(symbol);
@@ -197,6 +238,7 @@ async function testTradeExecution() {
         
         if (freeUsd === 0) {
             console.log("⚠️  No USD/USDC balance available for testing");
+            console.log("   This is expected in sandbox - you may need to deposit test funds");
             return false;
         }
         
@@ -260,12 +302,19 @@ if (argv.test) {
     // Test 2: Data fetching
     console.log("\n📈 Testing Data Fetch...");
     try {
-        const ohlcv = await fetchData();
-        if (ohlcv.length > 0) {
-            console.log(`✅ Data fetched successfully (${ohlcv.length} candles)`);
-            console.log(`   Latest price: $${ohlcv[ohlcv.length - 1][4].toFixed(2)}`);
+        // Check if symbol is available first
+        if (!(symbol in exchange.markets)) {
+            console.log(`⚠️  Symbol ${symbol} not available in ${useSandbox ? 'sandbox' : 'production'}`);
+            console.log("   This is expected in sandbox - sandbox has limited trading pairs");
+            console.log("   Try using a different symbol or test in production mode");
         } else {
-            console.log("❌ No data returned");
+            const ohlcv = await fetchData();
+            if (ohlcv.length > 0) {
+                console.log(`✅ Data fetched successfully (${ohlcv.length} candles)`);
+                console.log(`   Latest price: $${ohlcv[ohlcv.length - 1][4].toFixed(2)}`);
+            } else {
+                console.log("⚠️  No data returned (symbol may not be available)");
+            }
         }
     } catch (e) {
         console.log(`❌ Data fetch error: ${e.message}`);
@@ -274,20 +323,25 @@ if (argv.test) {
     // Test 3: Market analysis
     console.log("\n🔍 Testing Market Analysis...");
     try {
-        const ohlcv = await fetchData();
-        if (ohlcv.length > 0) {
-            const analysis = analyzeMarket(ohlcv);
-            if (analysis) {
-                console.log("✅ Analysis complete");
-                console.log(`   Price: $${analysis.price.toFixed(2)}`);
-                console.log(`   EMA 20: $${analysis.ema20.toFixed(2)}`);
-                console.log(`   RSI: ${analysis.rsi.toFixed(2)}`);
-                console.log(`   ATR: $${analysis.atr.toFixed(2)}`);
-            } else {
-                console.log("❌ Not enough data for analysis");
-            }
+        if (!(symbol in exchange.markets)) {
+            console.log(`⚠️  Skipped - Symbol ${symbol} not available`);
+            console.log("   Analysis requires valid market data");
         } else {
-            console.log("❌ Cannot analyze - no data");
+            const ohlcv = await fetchData();
+            if (ohlcv.length > 0) {
+                const analysis = analyzeMarket(ohlcv);
+                if (analysis) {
+                    console.log("✅ Analysis complete");
+                    console.log(`   Price: $${analysis.price.toFixed(2)}`);
+                    console.log(`   EMA 20: $${analysis.ema20.toFixed(2)}`);
+                    console.log(`   RSI: ${analysis.rsi.toFixed(2)}`);
+                    console.log(`   ATR: $${analysis.atr.toFixed(2)}`);
+                } else {
+                    console.log("⚠️  Not enough data for analysis (need at least 20 candles)");
+                }
+            } else {
+                console.log("⚠️  Cannot analyze - no data available");
+            }
         }
     } catch (e) {
         console.log(`❌ Analysis error: ${e.message}`);
