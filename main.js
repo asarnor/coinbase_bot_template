@@ -44,6 +44,9 @@ const argv = yargs(hideBin(process.argv))
 const useSandbox = argv.sandbox || argv.test;  // Auto-enable sandbox in test mode
 const enableTrading = argv.execute;
 
+// Get the exchange class - Use coinbaseexchange for sandbox support, coinbaseadvanced for production
+const ExchangeClass = useSandbox ? (ccxt.coinbaseexchange || ccxt.coinbaseadvanced) : (ccxt.coinbaseadvanced || ccxt.coinbaseexchange);
+
 if (argv.test) {
     console.log("🧪 TEST MODE ENABLED");
     console.log("=".repeat(60));
@@ -52,7 +55,7 @@ if (argv.test) {
 // API SETUP
 let exchange;
 try {
-    exchange = new ccxt.coinbasepro({
+    exchange = new ExchangeClass({
         apiKey: apiKey,
         secret: apiSecret,
         password: apiPassphrase,  // Coinbase Pro requires passphrase
