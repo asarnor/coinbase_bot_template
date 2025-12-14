@@ -5,43 +5,50 @@ import time
 import sys
 
 # --- CONFIGURATION ---
-symbol = 'ETH/USDT'
+symbol = 'ETH/USD'       # Coinbase uses USD, not USDT
 timeframe = '5m'         # Fast timeframe
-leverage = 5             # 5x Leverage
+leverage = 5             # 5x Leverage (for futures/advanced trade)
 risk_pct = 0.20          # Invest 20% of account balance
 atr_multiplier = 1.5     # 1.5x Volatility Safety Net
 
 # --- API KEYS (PASTE YOURS HERE) ---
+# Coinbase Pro requires: API Key, Secret, and Passphrase
 api_key = 'YOUR_API_KEY'
 api_secret = 'YOUR_SECRET_KEY'
+api_passphrase = 'YOUR_PASSPHRASE'  # Coinbase Pro passphrase
 
 # API SETUP
 try:
-    exchange = ccxt.binance({
+    exchange = ccxt.coinbasepro({
         'apiKey': api_key,
         'secret': api_secret,
+        'password': api_passphrase,  # Coinbase Pro requires passphrase
         'enableRateLimit': True,
-        'options': {'defaultType': 'future'} # Futures Mode
+        'sandbox': False,  # Set to True for sandbox testing
     })
     # Check connection
     exchange.load_markets()
-    print("✅ Connected to Exchange successfully.")
+    print("✅ Connected to Coinbase Pro successfully.")
 except Exception as e:
     print(f"❌ Connection Error: {e}")
+    print("Note: Coinbase Pro requires API Key, Secret, and Passphrase.")
     sys.exit()
 
-# Try setting leverage
+# Try setting leverage (Coinbase Advanced Trade supports futures)
 try:
+    # Coinbase Advanced Trade futures leverage setting
     exchange.set_leverage(leverage, symbol)
     print(f"⚡ Leverage set to {leverage}x.")
-except:
-    print("⚠️  Could not set leverage automatically. Ensure it is set in the app.")
+except Exception as e:
+    print(f"⚠️  Could not set leverage automatically: {e}")
+    print("⚠️  Ensure leverage is set manually in Coinbase Advanced Trade, or use spot trading.")
 
 print(f"🛡️ Active. Risking {risk_pct*100}% of balance per trade.")
 print(f"📉 Crash Protection: ATR Trailing Stop active.")
 
 in_position = False
 trailing_stop_price = 0.0
+position_amount = 0.0  # Track position size for exit orders
 
 def fetch_data():
     try:
@@ -55,8 +62,9 @@ def fetch_data():
 def get_position_size(current_price):
     try:
         balance = exchange.fetch_balance()
-        free_usdt = balance['USDT']['free']
-        margin_to_use = free_usdt * risk_pct
+        # Coinbase uses USD instead of USDT
+        free_usd = balance['USD']['free'] if 'USD' in balance else balance.get('USDC', {}).get('free', 0)
+        margin_to_use = free_usd * risk_pct
         position_value = margin_to_use * leverage
         amount_eth = position_value / current_price
         return amount_eth, margin_to_use
@@ -95,6 +103,7 @@ while True:
                     # exchange.create_market_buy_order(symbol, amount)
                     
                     trailing_stop_price = price - (atr * atr_multiplier)
+                    position_amount = amount  # Store position size for exit
                     in_position = True
 
         # --- SAFETY LOGIC ---
@@ -109,9 +118,10 @@ while True:
                 print(f"🚨 STOP LOSS TRIGGERED at ${price:.2f}")
                 
                 # UNCOMMENT TO ENABLE REAL TRADING:
-                # exchange.create_market_sell_order(symbol, amount, {'reduceOnly': True})
+                # exchange.create_market_sell_order(symbol, position_amount)
                 
                 in_position = False
                 trailing_stop_price = 0.0
+                position_amount = 0.0
 
     time.sleep(60) # Check every 60 seconds
