@@ -1,0 +1,27 @@
+{
+  "name": "coinbase-bot-template",
+  "version": "1.0.0",
+  "description": "A Node.js automated trading bot for Coinbase Pro/Advanced Trade using technical indicators",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "start": "node main.js",
+    "test": "node main.js --test",
+    "sandbox": "node main.js --sandbox",
+    "execute": "node main.js --execute"
+  },
+  "keywords": [
+    "coinbase",
+    "trading",
+    "bot",
+    "cryptocurrency",
+    "trading-bot"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "ccxt": "^4.2.0",
+    "technicalindicators": "^3.1.0",
+    "yargs": "^17.7.2"
+  }
+}
