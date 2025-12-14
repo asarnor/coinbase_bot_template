@@ -1,6 +1,6 @@
 # Coinbase Trading Bot Template
 
-A Python-based automated trading bot for Coinbase Pro/Advanced Trade that uses technical indicators (EMA, RSI, ATR) to execute trading strategies with risk management and trailing stop-loss protection.
+An automated trading bot for Coinbase Pro/Advanced Trade (available in **Python** and **JavaScript/Node.js**) that uses technical indicators (EMA, RSI, ATR) to execute trading strategies with risk management and trailing stop-loss protection.
 
 ## Features
 
@@ -12,7 +12,14 @@ A Python-based automated trading bot for Coinbase Pro/Advanced Trade that uses t
 
 ## Prerequisites
 
+**For Python version:**
 - Python 3.7 or higher
+- Coinbase Pro/Advanced Trade account with API access
+- API credentials (API Key, Secret, and Passphrase)
+
+**For JavaScript version:**
+- Node.js 15.0 or higher (ES modules support)
+- npm (comes with Node.js)
 - Coinbase Pro/Advanced Trade account with API access
 - API credentials (API Key, Secret, and Passphrase)
 
@@ -23,6 +30,8 @@ A Python-based automated trading bot for Coinbase Pro/Advanced Trade that uses t
    git clone <repository-url>
    cd coinbase_bot_template
    ```
+
+### Python Version
 
 2. **Create a virtual environment** (recommended):
    ```bash
@@ -42,6 +51,20 @@ A Python-based automated trading bot for Coinbase Pro/Advanced Trade that uses t
    
    **Note**: We use `pandas-ta-classic` (community fork) as the original `pandas-ta` library is no longer free/open source.
 
+### JavaScript Version
+
+2. **Install Node.js dependencies**:
+   ```bash
+   npm install
+   ```
+   
+   This will install:
+   - `ccxt` - Exchange API library
+   - `technicalindicators` - Technical analysis indicators
+   - `yargs` - Command-line argument parsing
+
+**Note**: Both Python and JavaScript versions provide identical functionality. Choose the version you're most comfortable with!
+
 ## Configuration
 
 ### 1. Get Coinbase API Credentials
@@ -58,7 +81,7 @@ A Python-based automated trading bot for Coinbase Pro/Advanced Trade that uses t
 
 ### 2. Configure the Bot
 
-Open `main.py` and update the following configuration:
+**For Python version**, open `main.py` and update:
 
 ```python
 # Trading Configuration
@@ -74,6 +97,22 @@ api_secret = 'YOUR_SECRET_KEY'
 api_passphrase = 'YOUR_PASSPHRASE'
 ```
 
+**For JavaScript version**, open `main.js` and update:
+
+```javascript
+// Trading Configuration
+const symbol = 'ETH/USD';       // Trading pair
+const timeframe = '5m';         // Candle timeframe
+const leverage = 5;             // Leverage multiplier
+const riskPct = 0.20;           // Risk percentage per trade (20%)
+const atrMultiplier = 1.5;      // ATR multiplier for stop loss
+
+// API Credentials
+const apiKey = 'YOUR_API_KEY';
+const apiSecret = 'YOUR_SECRET_KEY';
+const apiPassphrase = 'YOUR_PASSPHRASE';
+```
+
 ### 3. Sandbox vs Production
 
 The bot supports command-line flags for easy testing. Use `--sandbox` flag to test in Coinbase's sandbox environment, or `--test` for comprehensive testing (automatically uses sandbox).
@@ -86,8 +125,16 @@ The bot supports command-line flags for easy testing. Use `--sandbox` flag to te
 
 Run comprehensive tests to verify connection and functionality:
 
+**Python:**
 ```bash
 python main.py --test
+```
+
+**JavaScript:**
+```bash
+node main.js --test
+# or
+npm test
 ```
 
 This will:
@@ -104,8 +151,16 @@ This will:
 
 Run the bot in sandbox with simulated trading (no real orders):
 
+**Python:**
 ```bash
 python main.py --sandbox
+```
+
+**JavaScript:**
+```bash
+node main.js --sandbox
+# or
+npm run sandbox
 ```
 
 The bot will:
@@ -126,6 +181,7 @@ The bot will:
 
 To enable real trading, use the `--execute` flag:
 
+**Python:**
 ```bash
 # Sandbox with real sandbox trades (recommended for final testing)
 python main.py --sandbox --execute
@@ -134,10 +190,19 @@ python main.py --sandbox --execute
 python main.py --execute
 ```
 
+**JavaScript:**
+```bash
+# Sandbox with real sandbox trades (recommended for final testing)
+node main.js --sandbox --execute
+
+# Production with real trades (USE WITH EXTREME CAUTION!)
+node main.js --execute
+```
+
 **Command-line options:**
-- `--test` - Run comprehensive tests (auto-enables sandbox)
-- `--sandbox` - Use sandbox environment
-- `--execute` - Enable actual trade execution (use with caution!)
+- `--test` or `-t` - Run comprehensive tests (auto-enables sandbox)
+- `--sandbox` or `-s` - Use sandbox environment
+- `--execute` or `-e` - Enable actual trade execution (use with caution!)
 
 ## Trading Strategy
 
@@ -190,9 +255,16 @@ Price: $2460.75 | RSI: 56.20 | Stop: $2435.00
 - Review Coinbase's trading limits and restrictions
 
 ### Import Errors
+
+**Python:**
 - Ensure all dependencies are installed: `pip install -r requirements.txt`
 - Verify you're using the correct Python version (3.7+)
 - If you see `ModuleNotFoundError: No module named 'pandas_ta'`, ensure you installed `pandas-ta-classic` (the package name in requirements.txt)
+
+**JavaScript:**
+- Ensure all dependencies are installed: `npm install`
+- Verify you're using Node.js 15.0+ (for ES modules support)
+- If you see module errors, try deleting `node_modules` and `package-lock.json`, then run `npm install` again
 
 ## Important Disclaimers
 
@@ -222,10 +294,30 @@ For detailed testing instructions, see **[TESTING.md](TESTING.md)** which includ
 - Trade execution testing (sandbox)
 - Troubleshooting common issues
 
+## Python vs JavaScript Version
+
+Both versions provide **identical functionality**:
+
+| Feature | Python | JavaScript |
+|---------|--------|------------|
+| Technical Indicators | ✅ EMA, RSI, ATR | ✅ EMA, RSI, ATR |
+| Risk Management | ✅ | ✅ |
+| Trailing Stop Loss | ✅ | ✅ |
+| Sandbox Support | ✅ | ✅ |
+| Test Mode | ✅ | ✅ |
+| Command-line Args | ✅ | ✅ |
+
+**Choose based on your preference:**
+- **Python**: Better for data analysis, easier integration with pandas/ML libraries
+- **JavaScript**: Better for web integrations, async/await patterns, Node.js ecosystem
+
+Both versions use the same CCXT library under the hood, so API compatibility is identical.
+
 ## Support
 
 For issues related to:
 - **Coinbase API**: Check [Coinbase Pro API Documentation](https://docs.pro.coinbase.com/)
 - **CCXT Library**: Check [CCXT Documentation](https://docs.ccxt.com/)
-- **pandas-ta-classic**: Check [pandas-ta-classic GitHub](https://github.com/xgboosted/pandas-ta-classic)
+- **Python pandas-ta-classic**: Check [pandas-ta-classic GitHub](https://github.com/xgboosted/pandas-ta-classic)
+- **JavaScript technicalindicators**: Check [technicalindicators GitHub](https://github.com/anandanand84/technicalindicators)
 - **Bot Logic**: Review the code and modify as needed for your use case
