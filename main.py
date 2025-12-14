@@ -4,19 +4,26 @@ import pandas_ta_classic as ta
 import time
 import sys
 import argparse
+import os
+from dotenv import load_dotenv
+
+# Load base .env file first (for shared config)
+load_dotenv()
 
 # --- CONFIGURATION ---
-symbol = 'ETH/USD'       # Coinbase uses USD, not USDT
-timeframe = '5m'         # Fast timeframe
-leverage = 5             # 5x Leverage (for futures/advanced trade)
-risk_pct = 0.20          # Invest 20% of account balance
-atr_multiplier = 1.5     # 1.5x Volatility Safety Net
+# Read from environment variables, fallback to defaults
+symbol = os.getenv('TRADING_SYMBOL', 'ETH/USD')       # Coinbase uses USD, not USDT
+timeframe = os.getenv('TRADING_TIMEFRAME', '5m')       # Fast timeframe
+leverage = int(os.getenv('TRADING_LEVERAGE', '5'))     # 5x Leverage (for futures/advanced trade)
+risk_pct = float(os.getenv('TRADING_RISK_PCT', '0.20'))  # Invest 20% of account balance
+atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))  # 1.5x Volatility Safety Net
 
-# --- API KEYS (PASTE YOURS HERE) ---
-# Coinbase Pro requires: API Key, Secret, and Passphrase
-api_key = 'YOUR_API_KEY'
-api_secret = 'YOUR_SECRET_KEY'
-api_passphrase = 'YOUR_PASSPHRASE'  # Coinbase Pro passphrase
+# --- API KEYS ---
+# Read from environment variables (recommended) or use hardcoded values as fallback
+# Priority: Environment variables > .env file > hardcoded defaults
+api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
+api_secret = os.getenv('COINBASE_API_SECRET', 'YOUR_SECRET_KEY')
+api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', 'YOUR_PASSPHRASE')  # Coinbase Pro passphrase
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Coinbase Trading Bot')
@@ -28,6 +35,14 @@ args = parser.parse_args()
 # Determine if we should use sandbox
 use_sandbox = args.sandbox or args.test  # Auto-enable sandbox in test mode
 enable_trading = args.execute
+
+# Load environment-specific .env file if it exists (overrides base .env)
+# This allows separate API keys for sandbox vs production
+# Priority: .env.sandbox/.env.production > .env > hardcoded defaults
+if use_sandbox and os.path.exists('.env.sandbox'):
+    load_dotenv('.env.sandbox', override=True)
+elif not use_sandbox and os.path.exists('.env.production'):
+    load_dotenv('.env.production', override=True)
 
 if args.test:
     print("🧪 TEST MODE ENABLED")

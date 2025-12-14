@@ -2,21 +2,13 @@ import ccxt from 'ccxt';
 import { EMA, RSI, ATR } from 'technicalindicators';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
+import dotenv from 'dotenv';
+import { existsSync } from 'fs';
 
-// --- CONFIGURATION ---
-const symbol = 'ETH/USD';       // Coinbase uses USD, not USDT
-const timeframe = '5m';         // Fast timeframe
-const leverage = 5;             // 5x Leverage (for futures/advanced trade)
-const riskPct = 0.20;           // Invest 20% of account balance
-const atrMultiplier = 1.5;      // 1.5x Volatility Safety Net
+// Load base .env file first (for shared config)
+dotenv.config();
 
-// --- API KEYS (PASTE YOURS HERE) ---
-// Coinbase Pro requires: API Key, Secret, and Passphrase
-const apiKey = 'YOUR_API_KEY';
-const apiSecret = 'YOUR_SECRET_KEY';
-const apiPassphrase = 'YOUR_PASSPHRASE';  // Coinbase Pro passphrase
-
-// Parse command line arguments
+// Parse command line arguments first (needed to determine which env file to load)
 const argv = yargs(hideBin(process.argv))
     .option('test', {
         alias: 't',
@@ -43,6 +35,31 @@ const argv = yargs(hideBin(process.argv))
 // Determine if we should use sandbox
 const useSandbox = argv.sandbox || argv.test;  // Auto-enable sandbox in test mode
 const enableTrading = argv.execute;
+
+// Load environment-specific .env file if it exists (overrides base .env)
+// This allows separate API keys for sandbox vs production
+// Priority: .env.sandbox/.env.production > .env > hardcoded defaults
+if (useSandbox && existsSync('.env.sandbox')) {
+    dotenv.config({ path: '.env.sandbox', override: true });
+} else if (!useSandbox && existsSync('.env.production')) {
+    dotenv.config({ path: '.env.production', override: true });
+}
+
+// --- CONFIGURATION ---
+// Read from environment variables, fallback to defaults
+// These are read AFTER loading environment-specific files
+const symbol = process.env.TRADING_SYMBOL || 'ETH/USD';       // Coinbase uses USD, not USDT
+const timeframe = process.env.TRADING_TIMEFRAME || '5m';      // Fast timeframe
+const leverage = parseInt(process.env.TRADING_LEVERAGE || '5', 10);  // 5x Leverage (for futures/advanced trade)
+const riskPct = parseFloat(process.env.TRADING_RISK_PCT || '0.20');  // Invest 20% of account balance
+const atrMultiplier = parseFloat(process.env.TRADING_ATR_MULTIPLIER || '1.5');  // 1.5x Volatility Safety Net
+
+// --- API KEYS ---
+// Read from environment variables (recommended) or use hardcoded values as fallback
+// Priority: Environment variables > .env file > hardcoded defaults
+const apiKey = process.env.COINBASE_API_KEY || 'YOUR_API_KEY';
+const apiSecret = process.env.COINBASE_API_SECRET || 'YOUR_SECRET_KEY';
+const apiPassphrase = process.env.COINBASE_API_PASSPHRASE || 'YOUR_PASSPHRASE';  // Coinbase Pro passphrase
 
 // Validate API keys
 const hasPlaceholderKeys = apiKey === 'YOUR_API_KEY' || 

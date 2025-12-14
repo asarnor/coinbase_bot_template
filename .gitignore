@@ -39,6 +39,8 @@ wheels/
 .env
 .env.local
 .env.*.local
+.env.sandbox
+.env.production
 
 # API Keys and Secrets (extra safety)
 *.key

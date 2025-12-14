@@ -81,6 +81,60 @@ An automated trading bot for Coinbase Pro/Advanced Trade (available in **Python*
 
 ### 2. Configure the Bot
 
+**Recommended: Use Environment Variables (.env file)**
+
+The bot supports environment variables for secure credential storage. You have **three options**:
+
+### Option 1: Single .env file (Simplest)
+
+Use one `.env` file for both sandbox and production:
+
+1. **Copy the example environment file**:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Edit `.env`** and add your API credentials:
+   ```bash
+   COINBASE_API_KEY=your_api_key
+   COINBASE_API_SECRET=your_secret
+   COINBASE_API_PASSPHRASE=your_passphrase
+   ```
+
+### Option 2: Separate files for Sandbox and Production (Recommended)
+
+Use different API keys for sandbox vs production:
+
+1. **Copy the example files**:
+   ```bash
+   cp .env.sandbox.example .env.sandbox
+   cp .env.production.example .env.production
+   ```
+
+2. **Edit each file** with the appropriate credentials:
+   - `.env.sandbox` - Your sandbox/test API credentials
+   - `.env.production` - Your production API credentials
+
+3. **The bot automatically loads the correct file**:
+   - When using `--sandbox` or `--test`: loads `.env.sandbox`
+   - When running in production: loads `.env.production`
+   - Falls back to `.env` if environment-specific file doesn't exist
+
+### Option 3: System Environment Variables
+
+Set environment variables directly in your system (useful for CI/CD):
+```bash
+export COINBASE_API_KEY=your_key
+export COINBASE_API_SECRET=your_secret
+export COINBASE_API_PASSPHRASE=your_passphrase
+```
+
+**Note**: All `.env*` files are automatically ignored by git (already in `.gitignore`)
+
+**Alternative: Hardcode in Source Files**
+
+If you prefer not to use `.env` files, you can still configure directly in the source files:
+
 **For Python version**, open `main.py` and update:
 
 ```python
@@ -112,6 +166,8 @@ const apiKey = 'YOUR_API_KEY';
 const apiSecret = 'YOUR_SECRET_KEY';
 const apiPassphrase = 'YOUR_PASSPHRASE';
 ```
+
+**Note**: Environment variables take priority over hardcoded values. If both are set, the `.env` file values will be used.
 
 ### 3. Sandbox vs Production
 
@@ -260,11 +316,13 @@ Price: $2460.75 | RSI: 56.20 | Stop: $2435.00
 - Ensure all dependencies are installed: `pip install -r requirements.txt`
 - Verify you're using the correct Python version (3.7+)
 - If you see `ModuleNotFoundError: No module named 'pandas_ta'`, ensure you installed `pandas-ta-classic` (the package name in requirements.txt)
+- If you see `ModuleNotFoundError: No module named 'dotenv'`, run `pip install python-dotenv`
 
 **JavaScript:**
 - Ensure all dependencies are installed: `npm install`
 - Verify you're using Node.js 15.0+ (for ES modules support)
 - If you see module errors, try deleting `node_modules` and `package-lock.json`, then run `npm install` again
+- If environment variables aren't loading, ensure you've created a `.env` file from `.env.example`
 
 ## Important Disclaimers
 
@@ -276,11 +334,14 @@ Price: $2460.75 | RSI: 56.20 | Stop: $2435.00
 - Never invest more than you can afford to lose
 
 ⚠️ **Security Best Practices**:
+- **Use `.env` files** for API credentials (recommended) - they're automatically excluded from git
 - Never commit API credentials to version control
+- Never commit `.env` files (already in `.gitignore`)
 - Use environment variables or secure credential storage
 - Enable 2FA on your Coinbase account
 - Regularly rotate API keys
 - Use IP whitelisting if available
+- Keep your `.env` file secure and never share it
 
 ## License
 
