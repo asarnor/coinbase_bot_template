@@ -44,13 +44,32 @@ if use_sandbox and os.path.exists('.env.sandbox'):
 elif not use_sandbox and os.path.exists('.env.production'):
     load_dotenv('.env.production', override=True)
 
+# Re-read API keys after loading environment-specific files
+api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
+api_secret = os.getenv('COINBASE_API_SECRET', 'YOUR_SECRET_KEY')
+api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', 'YOUR_PASSPHRASE')
+
+# Validate API keys
+has_placeholder_keys = api_key == 'YOUR_API_KEY' or api_secret == 'YOUR_SECRET_KEY' or api_passphrase == 'YOUR_PASSPHRASE'
+
+if has_placeholder_keys:
+    print("⚠️  WARNING: API keys are set to placeholder values!")
+    print("   Please update API keys in .env file or environment variables")
+    print("   Tests that require authentication will fail.\n")
+
 if args.test:
     print("🧪 TEST MODE ENABLED")
     print("=" * 60)
 
 # API SETUP
 try:
-    exchange = ccxt.coinbasepro({
+    # Get the exchange class - Use coinbaseexchange for sandbox support, coinbaseadvanced for production
+    ExchangeClass = ccxt.coinbaseexchange if use_sandbox else ccxt.coinbaseadvanced
+    if not ExchangeClass:
+        # Fallback if exchange class not available
+        ExchangeClass = ccxt.coinbaseadvanced or ccxt.coinbaseexchange
+    
+    exchange = ExchangeClass({
         'apiKey': api_key,
         'secret': api_secret,
         'password': api_passphrase,  # Coinbase Pro requires passphrase
@@ -92,7 +111,12 @@ def fetch_data():
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         return df
     except Exception as e:
-        print(f"Data Error: {e}")
+        error_msg = str(e)
+        if 'does not have market symbol' in error_msg:
+            print(f"Data Error: Symbol {symbol} not available in {'sandbox' if use_sandbox else 'production'}")
+            print(f"   This is expected in sandbox mode - sandbox may have limited trading pairs")
+        else:
+            print(f"Data Error: {error_msg}")
         return pd.DataFrame()
 
 def analyze_market(df):
@@ -106,6 +130,12 @@ def test_balance():
     """Test fetching account balance"""
     try:
         print("\n💰 Testing Balance Fetch...")
+        
+        if has_placeholder_keys:
+            print("⚠️  Skipped - API keys are placeholders (authentication required)")
+            print("   Update API keys in .env file to test balance fetching")
+            return None
+        
         balance = exchange.fetch_balance()
         print("✅ Balance fetched successfully")
         
@@ -120,7 +150,13 @@ def test_balance():
         
         return balance
     except Exception as e:
-        print(f"❌ Balance Error: {e}")
+        error_msg = str(e)
+        if 'invalid base64' in error_msg or 'sign()' in error_msg:
+            print(f"❌ Balance Error: Invalid API credentials")
+            print(f"   {error_msg}")
+            print("   Please check your API key, secret, and passphrase in .env file")
+        else:
+            print(f"❌ Balance Error: {error_msg}")
         return None
 
 # Test trade execution (dry run or actual)
@@ -128,6 +164,16 @@ def test_trade_execution():
     """Test trade execution capability"""
     try:
         print("\n🧪 Testing Trade Execution...")
+        
+        if has_placeholder_keys:
+            print("⚠️  Skipped - API keys are placeholders (authentication required)")
+            print("   Update API keys in .env file to test trade execution")
+            return False
+        
+        if symbol not in exchange.markets:
+            print(f"⚠️  Skipped - Symbol {symbol} not available")
+            print("   Trade execution requires a valid trading pair")
+            return False
         
         # Fetch current price
         ticker = exchange.fetch_ticker(symbol)
@@ -197,28 +243,38 @@ if args.test:
     # Test 2: Data fetching
     print("\n📈 Testing Data Fetch...")
     try:
-        df = fetch_data()
-        if not df.empty:
-            print(f"✅ Data fetched successfully ({len(df)} candles)")
-            print(f"   Latest price: ${df.iloc[-1]['close']:.2f}")
+        # Check if symbol is available first
+        if symbol not in exchange.markets:
+            print(f"⚠️  Symbol {symbol} not available in {'sandbox' if use_sandbox else 'production'}")
+            print("   This is expected in sandbox - sandbox has limited trading pairs")
+            print("   Try using a different symbol or test in production mode")
         else:
-            print("❌ No data returned")
+            df = fetch_data()
+            if not df.empty:
+                print(f"✅ Data fetched successfully ({len(df)} candles)")
+                print(f"   Latest price: ${df.iloc[-1]['close']:.2f}")
+            else:
+                print("⚠️  No data returned (symbol may not be available)")
     except Exception as e:
         print(f"❌ Data fetch error: {e}")
     
     # Test 3: Market analysis
     print("\n🔍 Testing Market Analysis...")
     try:
-        df = fetch_data()
-        if not df.empty:
-            row = analyze_market(df)
-            print(f"✅ Analysis complete")
-            print(f"   Price: ${row['close']:.2f}")
-            print(f"   EMA 20: ${row['ema_20']:.2f}")
-            print(f"   RSI: {row['rsi']:.2f}")
-            print(f"   ATR: ${row['atr']:.2f}")
+        if symbol not in exchange.markets:
+            print(f"⚠️  Skipped - Symbol {symbol} not available")
+            print("   Analysis requires valid market data")
         else:
-            print("❌ Cannot analyze - no data")
+            df = fetch_data()
+            if not df.empty:
+                row = analyze_market(df)
+                print(f"✅ Analysis complete")
+                print(f"   Price: ${row['close']:.2f}")
+                print(f"   EMA 20: ${row['ema_20']:.2f}")
+                print(f"   RSI: {row['rsi']:.2f}")
+                print(f"   ATR: ${row['atr']:.2f}")
+            else:
+                print("⚠️  Cannot analyze - no data available")
     except Exception as e:
         print(f"❌ Analysis error: {e}")
     
