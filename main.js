@@ -57,18 +57,19 @@ const atrMultiplier = parseFloat(process.env.TRADING_ATR_MULTIPLIER || '1.5');  
 // --- API KEYS ---
 // Read from environment variables (recommended) or use hardcoded values as fallback
 // Priority: Environment variables > .env file > hardcoded defaults
+// Note: Coinbase Advanced Trade API may not require a passphrase (unlike legacy Coinbase Pro)
 const apiKey = process.env.COINBASE_API_KEY || 'YOUR_API_KEY';
 const apiSecret = process.env.COINBASE_API_SECRET || 'YOUR_SECRET_KEY';
-const apiPassphrase = process.env.COINBASE_API_PASSPHRASE || 'YOUR_PASSPHRASE';  // Coinbase Pro passphrase
+const apiPassphrase = process.env.COINBASE_API_PASSPHRASE || '';  // Optional - only needed for legacy Coinbase Pro
 
-// Validate API keys
+// Validate API keys (passphrase is optional for Advanced Trade API)
 const hasPlaceholderKeys = apiKey === 'YOUR_API_KEY' || 
-                          apiSecret === 'YOUR_SECRET_KEY' || 
-                          apiPassphrase === 'YOUR_PASSPHRASE';
+                          apiSecret === 'YOUR_SECRET_KEY';
 
 if (hasPlaceholderKeys) {
     console.log("⚠️  WARNING: API keys are set to placeholder values!");
-    console.log("   Please update apiKey, apiSecret, and apiPassphrase in main.js");
+    console.log("   Please update apiKey and apiSecret in .env file or main.js");
+    console.log("   Passphrase is optional (only needed for legacy Coinbase Pro)");
     console.log("   Tests that require authentication will fail.\n");
 }
 
@@ -83,18 +84,24 @@ if (argv.test) {
 // API SETUP
 let exchange;
 try {
-    exchange = new ExchangeClass({
+    // Build exchange config - passphrase is optional for Advanced Trade API
+    const exchangeConfig = {
         apiKey: apiKey,
         secret: apiSecret,
-        password: apiPassphrase,  // Coinbase Pro requires passphrase
         enableRateLimit: true,
         sandbox: useSandbox,
-    });
+    };
+    // Only add password/passphrase if provided (required for legacy Coinbase Pro, optional for Advanced Trade)
+    if (apiPassphrase) {
+        exchangeConfig.password = apiPassphrase;
+    }
+    
+    exchange = new ExchangeClass(exchangeConfig);
     
     // Check connection
     console.log(`🔌 Connecting to ${useSandbox ? 'SANDBOX' : 'PRODUCTION'}...`);
     await exchange.loadMarkets();
-    console.log("✅ Connected to Coinbase Pro successfully.");
+    console.log("✅ Connected to Coinbase Advanced Trade successfully.");
     
     if (argv.test) {
         console.log(`📊 Loaded ${Object.keys(exchange.markets).length} markets`);
@@ -110,7 +117,10 @@ try {
     }
 } catch (e) {
     console.log(`❌ Connection Error: ${e.message}`);
-    console.log("Note: Coinbase Pro requires API Key, Secret, and Passphrase.");
+    console.log("Note: Coinbase Advanced Trade requires API Key and Secret.");
+    if (e.message.toLowerCase().includes('passphrase') || e.message.toLowerCase().includes('password')) {
+        console.log("   If you're using legacy Coinbase Pro, you may also need a passphrase.");
+    }
     process.exit(1);
 }
 

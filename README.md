@@ -69,13 +69,14 @@ An automated trading bot for Coinbase Pro/Advanced Trade (available in **Python*
 
 ### 1. Get Coinbase API Credentials
 
-1. Log in to your Coinbase Pro/Advanced Trade account
-2. Navigate to **Settings** → **API** → **New API Key**
+1. Log in to your Coinbase Advanced Trade account (via [Coinbase Developer Platform](https://portal.cdp.coinbase.com/))
+2. Navigate to **API Keys** section
 3. Create an API key with appropriate permissions:
    - **View** (required)
    - **Trade** (required for executing orders)
    - **Transfer** (optional, only if needed)
-4. Save your **API Key**, **Secret**, and **Passphrase** securely
+4. Save your **API Key** and **Secret** securely
+   - **Note**: Coinbase Advanced Trade API does **not** require a passphrase (unlike legacy Coinbase Pro)
 
 ⚠️ **Important**: Never share your API credentials or commit them to version control.
 
@@ -98,7 +99,7 @@ Use one `.env` file for both sandbox and production:
    ```bash
    COINBASE_API_KEY=your_api_key
    COINBASE_API_SECRET=your_secret
-   COINBASE_API_PASSPHRASE=your_passphrase
+   # COINBASE_API_PASSPHRASE=  # Optional - only needed for legacy Coinbase Pro
    ```
 
 ### Option 2: Separate files for Sandbox and Production (Recommended)
@@ -126,7 +127,7 @@ Set environment variables directly in your system (useful for CI/CD):
 ```bash
 export COINBASE_API_KEY=your_key
 export COINBASE_API_SECRET=your_secret
-export COINBASE_API_PASSPHRASE=your_passphrase
+# export COINBASE_API_PASSPHRASE=your_passphrase  # Optional - only for legacy Coinbase Pro
 ```
 
 **Note**: All `.env*` files are automatically ignored by git (already in `.gitignore`)

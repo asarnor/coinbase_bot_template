@@ -21,9 +21,10 @@ atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))  # 1.5x Volat
 # --- API KEYS ---
 # Read from environment variables (recommended) or use hardcoded values as fallback
 # Priority: Environment variables > .env file > hardcoded defaults
+# Note: Coinbase Advanced Trade API may not require a passphrase (unlike legacy Coinbase Pro)
 api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
 api_secret = os.getenv('COINBASE_API_SECRET', 'YOUR_SECRET_KEY')
-api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', 'YOUR_PASSPHRASE')  # Coinbase Pro passphrase
+api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', '')  # Optional - only needed for legacy Coinbase Pro
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Coinbase Trading Bot')
@@ -47,10 +48,10 @@ elif not use_sandbox and os.path.exists('.env.production'):
 # Re-read API keys after loading environment-specific files
 api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
 api_secret = os.getenv('COINBASE_API_SECRET', 'YOUR_SECRET_KEY')
-api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', 'YOUR_PASSPHRASE')
+api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', '')  # Optional - only needed for legacy Coinbase Pro
 
-# Validate API keys
-has_placeholder_keys = api_key == 'YOUR_API_KEY' or api_secret == 'YOUR_SECRET_KEY' or api_passphrase == 'YOUR_PASSPHRASE'
+# Validate API keys (passphrase is optional for Advanced Trade API)
+has_placeholder_keys = api_key == 'YOUR_API_KEY' or api_secret == 'YOUR_SECRET_KEY'
 
 if has_placeholder_keys:
     print("⚠️  WARNING: API keys are set to placeholder values!")
@@ -71,17 +72,22 @@ try:
     else:
         ExchangeClass = ccxt.coinbaseadvanced or ccxt.coinbaseexchange
     
-    exchange = ExchangeClass({
+    # Build exchange config - passphrase is optional for Advanced Trade API
+    exchange_config = {
         'apiKey': api_key,
         'secret': api_secret,
-        'password': api_passphrase,  # Coinbase Pro requires passphrase
         'enableRateLimit': True,
         'sandbox': use_sandbox,
-    })
+    }
+    # Only add password/passphrase if provided (required for legacy Coinbase Pro, optional for Advanced Trade)
+    if api_passphrase:
+        exchange_config['password'] = api_passphrase
+    
+    exchange = ExchangeClass(exchange_config)
     # Check connection
     print(f"🔌 Connecting to {'SANDBOX' if use_sandbox else 'PRODUCTION'}...")
     exchange.load_markets()
-    print("✅ Connected to Coinbase Pro successfully.")
+    print("✅ Connected to Coinbase Advanced Trade successfully.")
     
     if args.test:
         print(f"📊 Loaded {len(exchange.markets)} markets")
@@ -94,7 +100,9 @@ try:
             print("   Available ETH pairs:", [m for m in exchange.markets.keys() if 'ETH' in m][:10])
 except Exception as e:
     print(f"❌ Connection Error: {e}")
-    print("Note: Coinbase Pro requires API Key, Secret, and Passphrase.")
+    print("Note: Coinbase Advanced Trade requires API Key and Secret.")
+    if 'passphrase' in str(e).lower() or 'password' in str(e).lower():
+        print("   If you're using legacy Coinbase Pro, you may also need a passphrase.")
     sys.exit()
 
 # Try setting leverage (Coinbase Advanced Trade supports futures)
