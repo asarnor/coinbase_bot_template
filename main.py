@@ -50,6 +50,10 @@ api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
 api_secret = os.getenv('COINBASE_API_SECRET', 'YOUR_SECRET_KEY')
 api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', '')  # Optional - only needed for legacy Coinbase Pro
 
+# Convert literal \n strings to actual newlines (common when storing multi-line secrets in .env)
+if api_secret and '\\n' in api_secret:
+    api_secret = api_secret.replace('\\n', '\n')
+
 # Validate API keys (passphrase is optional for Advanced Trade API)
 has_placeholder_keys = api_key == 'YOUR_API_KEY' or api_secret == 'YOUR_SECRET_KEY'
 
@@ -72,15 +76,21 @@ try:
     else:
         ExchangeClass = ccxt.coinbaseadvanced or ccxt.coinbaseexchange
     
-    # Build exchange config - passphrase is optional for Advanced Trade API
+    # Build exchange config
+    # Note: Sandbox (coinbaseexchange) requires password field even if empty
+    # Production (coinbaseadvanced) doesn't require it for Advanced Trade API
     exchange_config = {
         'apiKey': api_key,
         'secret': api_secret,
         'enableRateLimit': True,
         'sandbox': use_sandbox,
     }
-    # Only add password/passphrase if provided (required for legacy Coinbase Pro, optional for Advanced Trade)
-    if api_passphrase:
+    # Sandbox requires password field (can be empty), production Advanced Trade doesn't need it
+    if use_sandbox:
+        # Always include password for sandbox, even if empty
+        exchange_config['password'] = api_passphrase if api_passphrase else ''
+    elif api_passphrase:
+        # Only include password for production if provided (legacy Coinbase Pro)
         exchange_config['password'] = api_passphrase
     
     exchange = ExchangeClass(exchange_config)

@@ -59,8 +59,13 @@ const atrMultiplier = parseFloat(process.env.TRADING_ATR_MULTIPLIER || '1.5');  
 // Priority: Environment variables > .env file > hardcoded defaults
 // Note: Coinbase Advanced Trade API may not require a passphrase (unlike legacy Coinbase Pro)
 const apiKey = process.env.COINBASE_API_KEY || 'YOUR_API_KEY';
-const apiSecret = process.env.COINBASE_API_SECRET || 'YOUR_SECRET_KEY';
+let apiSecret = process.env.COINBASE_API_SECRET || 'YOUR_SECRET_KEY';
 const apiPassphrase = process.env.COINBASE_API_PASSPHRASE || '';  // Optional - only needed for legacy Coinbase Pro
+
+// Convert literal \n strings to actual newlines (common when storing multi-line secrets in .env)
+if (apiSecret && apiSecret.includes('\\n')) {
+    apiSecret = apiSecret.replace(/\\n/g, '\n');
+}
 
 // Validate API keys (passphrase is optional for Advanced Trade API)
 const hasPlaceholderKeys = apiKey === 'YOUR_API_KEY' || 
@@ -84,16 +89,18 @@ if (argv.test) {
 // API SETUP
 let exchange;
 try {
-    // Build exchange config - passphrase is optional for Advanced Trade API
+    // Build exchange config
+    // Note: Sandbox (coinbaseexchange) requires password field even if empty
+    // Production (coinbaseadvanced) doesn't require it for Advanced Trade API
     const exchangeConfig = {
         apiKey: apiKey,
         secret: apiSecret,
         enableRateLimit: true,
         sandbox: useSandbox,
     };
-    // Only add password/passphrase if provided (required for legacy Coinbase Pro, optional for Advanced Trade)
-    if (apiPassphrase) {
-        exchangeConfig.password = apiPassphrase;
+    // Sandbox requires password field (can be empty), production Advanced Trade doesn't need it
+    if (useSandbox || apiPassphrase) {
+        exchangeConfig.password = apiPassphrase || '';
     }
     
     exchange = new ExchangeClass(exchangeConfig);
