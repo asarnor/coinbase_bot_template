@@ -64,9 +64,11 @@ if args.test:
 # API SETUP
 try:
     # Get the exchange class - Use coinbaseexchange for sandbox support, coinbaseadvanced for production
-    ExchangeClass = ccxt.coinbaseexchange if use_sandbox else ccxt.coinbaseadvanced
-    if not ExchangeClass:
-        # Fallback if exchange class not available
+    # Fallback chain ensures we get a valid exchange class even if one is missing
+    # Using OR operators similar to JavaScript implementation
+    if use_sandbox:
+        ExchangeClass = ccxt.coinbaseexchange or ccxt.coinbaseadvanced
+    else:
         ExchangeClass = ccxt.coinbaseadvanced or ccxt.coinbaseexchange
     
     exchange = ExchangeClass({
