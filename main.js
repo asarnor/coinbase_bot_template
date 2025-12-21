@@ -53,6 +53,7 @@ const timeframe = process.env.TRADING_TIMEFRAME || '5m';      // Fast timeframe
 const leverage = parseInt(process.env.TRADING_LEVERAGE || '5', 10);  // 5x Leverage (for futures/advanced trade)
 const riskPct = parseFloat(process.env.TRADING_RISK_PCT || '0.20');  // Invest 20% of account balance
 const atrMultiplier = parseFloat(process.env.TRADING_ATR_MULTIPLIER || '1.5');  // 1.5x Volatility Safety Net
+const checkInterval = parseInt(process.env.TRADING_CHECK_INTERVAL || '60', 10);  // Check market every N seconds (default: 60)
 
 // --- API KEYS ---
 // Read from environment variables (recommended) or use hardcoded values as fallback
@@ -394,6 +395,7 @@ if (argv.test) {
 
 console.log(`🛡️ Active. Risking ${(riskPct * 100).toFixed(1)}% of balance per trade.`);
 console.log(`📉 Crash Protection: ATR Trailing Stop active.`);
+console.log(`⏱️  Check Interval: ${checkInterval} seconds`);
 if (enableTrading) {
     console.log(`⚠️  TRADING ENABLED - Real orders will be executed!`);
 } else {
@@ -513,5 +515,5 @@ while (true) {
         console.log(`Error in main loop: ${e.message}`);
     }
     
-    await sleep(60000); // Check every 60 seconds
+    await sleep(checkInterval * 1000);  // Check every N seconds (configurable via TRADING_CHECK_INTERVAL)
 }

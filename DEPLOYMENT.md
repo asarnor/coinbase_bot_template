@@ -44,6 +44,7 @@ Railway is the simplest option with a generous free tier and automatic deploymen
      TRADING_LEVERAGE=5
      TRADING_RISK_PCT=0.20
      TRADING_ATR_MULTIPLIER=1.5
+     TRADING_CHECK_INTERVAL=60
      ```
 
 4. **Deploy**
@@ -142,6 +143,7 @@ AWS EC2 gives you full control but requires more setup.
    export TRADING_LEVERAGE="5"
    export TRADING_RISK_PCT="0.20"
    export TRADING_ATR_MULTIPLIER="1.5"
+   export TRADING_CHECK_INTERVAL="60"
    ```
 
 7. **Run with Screen/Tmux (keeps running after disconnect)**
@@ -182,6 +184,7 @@ AWS EC2 gives you full control but requires more setup.
    Environment="TRADING_LEVERAGE=5"
    Environment="TRADING_RISK_PCT=0.20"
    Environment="TRADING_ATR_MULTIPLIER=1.5"
+   Environment="TRADING_CHECK_INTERVAL=60"
    ExecStart=/usr/bin/python3 /home/ubuntu/coinbase_bot_template/main.py --execute
    Restart=always
    RestartSec=10

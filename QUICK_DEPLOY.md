@@ -30,6 +30,7 @@ In Railway dashboard:
   TRADING_LEVERAGE=5
   TRADING_RISK_PCT=0.20
   TRADING_ATR_MULTIPLIER=1.5
+  TRADING_CHECK_INTERVAL=60
   ```
 
 ### Step 4: Deploy!
@@ -102,7 +103,7 @@ docker-compose down
 
 1. **Check Logs**: View logs in your platform's dashboard
 2. **Test Connection**: Look for "✅ Connected to Coinbase Advanced Trade successfully"
-3. **Monitor Activity**: Bot should show price updates every 60 seconds
+3. **Monitor Activity**: Bot should show price updates every N seconds (default: 60, configurable via TRADING_CHECK_INTERVAL)
 
 ---
 

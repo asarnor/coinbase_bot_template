@@ -145,6 +145,7 @@ timeframe = '5m'         # Candle timeframe
 leverage = 5             # Leverage multiplier
 risk_pct = 0.20          # Risk percentage per trade (20%)
 atr_multiplier = 1.5     # ATR multiplier for stop loss
+check_interval = 60      # Check market every N seconds (default: 60)
 
 # API Credentials
 api_key = 'YOUR_API_KEY'
@@ -161,6 +162,7 @@ const timeframe = '5m';         // Candle timeframe
 const leverage = 5;             // Leverage multiplier
 const riskPct = 0.20;           // Risk percentage per trade (20%)
 const atrMultiplier = 1.5;      // ATR multiplier for stop loss
+const checkInterval = 60;       // Check market every N seconds (default: 60)
 
 // API Credentials
 const apiKey = 'YOUR_API_KEY';
@@ -292,6 +294,7 @@ Example output:
 ⚡ Leverage set to 5x.
 🛡️ Active. Risking 20.0% of balance per trade.
 📉 Crash Protection: ATR Trailing Stop active.
+⏱️  Check Interval: 60 seconds
 Price: $2450.50 | RSI: 55.30 | Stop: $0.00
 🚀 ENTER LONG: Buying 0.1020 ETH (Cost: $50.00)
 Price: $2460.75 | RSI: 56.20 | Stop: $2435.00

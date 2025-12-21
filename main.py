@@ -17,6 +17,7 @@ timeframe = os.getenv('TRADING_TIMEFRAME', '5m')       # Fast timeframe
 leverage = int(os.getenv('TRADING_LEVERAGE', '5'))     # 5x Leverage (for futures/advanced trade)
 risk_pct = float(os.getenv('TRADING_RISK_PCT', '0.20'))  # Invest 20% of account balance
 atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))  # 1.5x Volatility Safety Net
+check_interval = int(os.getenv('TRADING_CHECK_INTERVAL', '60'))  # Check market every N seconds (default: 60)
 
 # --- API KEYS ---
 # Read from environment variables (recommended) or use hardcoded values as fallback
@@ -309,6 +310,7 @@ if args.test:
 
 print(f"🛡️ Active. Risking {risk_pct*100}% of balance per trade.")
 print(f"📉 Crash Protection: ATR Trailing Stop active.")
+print(f"⏱️  Check Interval: {check_interval} seconds")
 if enable_trading:
     print(f"⚠️  TRADING ENABLED - Real orders will be executed!")
 else:
@@ -390,4 +392,4 @@ while True:
                 trailing_stop_price = 0.0
                 position_amount = 0.0
 
-    time.sleep(60) # Check every 60 seconds
+    time.sleep(check_interval)  # Check every N seconds (configurable via TRADING_CHECK_INTERVAL)

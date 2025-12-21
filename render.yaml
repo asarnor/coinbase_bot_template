@@ -22,4 +22,6 @@ services:
         value: 0.20
       - key: TRADING_ATR_MULTIPLIER
         value: 1.5
+      - key: TRADING_CHECK_INTERVAL
+        value: 60
 
