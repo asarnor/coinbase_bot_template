@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  coinbase-bot:
+    build: .
+    container_name: coinbase-trading-bot
+    restart: unless-stopped
+    environment:
+      - COINBASE_API_KEY=${COINBASE_API_KEY}
+      - COINBASE_API_SECRET=${COINBASE_API_SECRET}
+      - COINBASE_API_PASSPHRASE=${COINBASE_API_PASSPHRASE:-}
+      - TRADING_SYMBOL=${TRADING_SYMBOL:-ETH/USD}
+      - TRADING_TIMEFRAME=${TRADING_TIMEFRAME:-5m}
+      - TRADING_LEVERAGE=${TRADING_LEVERAGE:-5}
+      - TRADING_RISK_PCT=${TRADING_RISK_PCT:-0.20}
+      - TRADING_ATR_MULTIPLIER=${TRADING_ATR_MULTIPLIER:-1.5}
+    # Uncomment to test without executing trades
+    # command: python main.py --sandbox
+    volumes:
+      - ./logs:/app/logs  # Optional: mount logs directory
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+

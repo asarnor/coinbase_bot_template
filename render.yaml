@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: coinbase-trading-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py --execute
+    envVars:
+      - key: COINBASE_API_KEY
+        sync: false
+      - key: COINBASE_API_SECRET
+        sync: false
+      - key: COINBASE_API_PASSPHRASE
+        sync: false
+        optional: true
+      - key: TRADING_SYMBOL
+        value: ETH/USD
+      - key: TRADING_TIMEFRAME
+        value: 5m
+      - key: TRADING_LEVERAGE
+        value: 5
+      - key: TRADING_RISK_PCT
+        value: 0.20
+      - key: TRADING_ATR_MULTIPLIER
+        value: 1.5
+

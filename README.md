@@ -375,6 +375,33 @@ Both versions provide **identical functionality**:
 
 Both versions use the same CCXT library under the hood, so API compatibility is identical.
 
+## Cloud Deployment
+
+Want to run your bot 24/7 in the cloud? We've got you covered!
+
+### Quick Start (5 minutes)
+See **[QUICK_DEPLOY.md](QUICK_DEPLOY.md)** for the fastest deployment options.
+
+### Full Guide
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for comprehensive deployment instructions including:
+- **Railway** (Recommended - Easiest)
+- **Render** (Free tier available)
+- **AWS EC2** (Full control)
+- **Google Cloud Run** (Serverless)
+- **Docker** (Any platform)
+
+### Docker Support
+The project includes:
+- `Dockerfile` for containerization
+- `docker-compose.yml` for local testing
+- `.dockerignore` for optimized builds
+
+**Quick Docker test:**
+```bash
+docker build -t coinbase-bot .
+docker run -e COINBASE_API_KEY=your_key -e COINBASE_API_SECRET=your_secret coinbase-bot
+```
+
 ## Support
 
 For issues related to:
@@ -383,3 +410,4 @@ For issues related to:
 - **Python pandas-ta-classic**: Check [pandas-ta-classic GitHub](https://github.com/xgboosted/pandas-ta-classic)
 - **JavaScript technicalindicators**: Check [technicalindicators GitHub](https://github.com/anandanand84/technicalindicators)
 - **Bot Logic**: Review the code and modify as needed for your use case
+- **Deployment**: See [DEPLOYMENT.md](DEPLOYMENT.md) for cloud deployment help
