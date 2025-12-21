@@ -124,10 +124,26 @@ try {
         }
     }
 } catch (e) {
-    console.log(`❌ Connection Error: ${e.message}`);
-    console.log("Note: Coinbase Advanced Trade requires API Key and Secret.");
-    if (e.message.toLowerCase().includes('passphrase') || e.message.toLowerCase().includes('password')) {
-        console.log("   If you're using legacy Coinbase Pro, you may also need a passphrase.");
+    const errorMsg = e.message;
+    console.log(`❌ Connection Error: ${errorMsg}`);
+    console.log("\n" + "=".repeat(60));
+    console.log("TROUBLESHOOTING 401 UNAUTHORIZED ERROR");
+    console.log("=".repeat(60));
+    console.log("This usually means an authentication issue. Check:");
+    console.log("1. ✅ API Key is set correctly in environment variables");
+    console.log("2. ✅ API Secret is set correctly (complete, no truncation)");
+    console.log("3. ✅ API Secret format: If multi-line, use \\n or actual newlines");
+    console.log("4. ✅ API Key has 'View' and 'Trade' permissions in Coinbase");
+    console.log("5. ✅ Using Coinbase Advanced Trade API (not legacy Pro)");
+    console.log("\nCommon fixes:");
+    console.log("- Re-enter API Secret in Railway (copy fresh from Coinbase)");
+    console.log("- Ensure secret starts with '-----BEGIN EC PRIVATE KEY-----'");
+    console.log("- Check Railway Variables tab - no extra quotes/spaces");
+    console.log("- Test locally first: node main.js --test");
+    console.log("\nSee RAILWAY_TROUBLESHOOTING.md for detailed help");
+    console.log("=".repeat(60));
+    if (errorMsg.toLowerCase().includes('passphrase') || errorMsg.toLowerCase().includes('password')) {
+        console.log("\nNote: If you're using legacy Coinbase Pro, you may also need a passphrase.");
     }
     process.exit(1);
 }
