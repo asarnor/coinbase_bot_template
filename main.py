@@ -51,9 +51,20 @@ api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
 api_secret = os.getenv('COINBASE_API_SECRET', 'YOUR_SECRET_KEY')
 api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', '')  # Optional - only needed for legacy Coinbase Pro
 
+# Debug: Check if credentials are set (for Railway troubleshooting)
+if not args.test:
+    print(f"🔍 Debug: API Key present: {bool(api_key and api_key != 'YOUR_API_KEY')}")
+    print(f"🔍 Debug: API Secret present: {bool(api_secret and api_secret != 'YOUR_SECRET_KEY')}")
+    if api_secret:
+        print(f"🔍 Debug: Secret length: {len(api_secret)} characters")
+        print(f"🔍 Debug: Secret starts with BEGIN: {api_secret.startswith('-----BEGIN')}")
+        print(f"🔍 Debug: Contains \\n: {'\\n' in api_secret}")
+
 # Convert literal \n strings to actual newlines (common when storing multi-line secrets in .env)
 if api_secret and '\\n' in api_secret:
     api_secret = api_secret.replace('\\n', '\n')
+    if not args.test:
+        print(f"🔍 Debug: Converted \\n to actual newlines")
 
 # Validate API keys (passphrase is optional for Advanced Trade API)
 has_placeholder_keys = api_key == 'YOUR_API_KEY' or api_secret == 'YOUR_SECRET_KEY'
