@@ -58,7 +58,8 @@ if not args.test:
     if api_secret:
         print(f"🔍 Debug: Secret length: {len(api_secret)} characters")
         print(f"🔍 Debug: Secret starts with BEGIN: {api_secret.startswith('-----BEGIN')}")
-        print(f"🔍 Debug: Contains \\n: {'\\n' in api_secret}")
+        has_backslash_n = '\\n' in api_secret
+        print(f"🔍 Debug: Contains \\n: {has_backslash_n}")
 
 # Convert literal \n strings to actual newlines (common when storing multi-line secrets in .env)
 if api_secret and '\\n' in api_secret:
