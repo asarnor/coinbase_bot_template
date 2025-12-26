@@ -406,6 +406,54 @@ docker build -t coinbase-bot .
 docker run -e COINBASE_API_KEY=your_key -e COINBASE_API_SECRET=your_secret coinbase-bot
 ```
 
+## Additional Tools
+
+### Portfolio Cleanup Script
+
+The `cleanup_portfolio.py` script automatically analyzes your portfolio and sells small/irrelevant positions to USD, freeing up capital for trading ETH, Bitcoin, and other valuable assets.
+
+**Features:**
+- Analyzes all positions and calculates USD values
+- Identifies positions worth less than a minimum threshold (default: $5)
+- Automatically sells small positions to USD
+- Preserves BTC and ETH (priority currencies)
+- Only sells free balance (not locked in orders)
+
+**Usage:**
+```bash
+python cleanup_portfolio.py
+```
+
+**Configuration:**
+Add to `.env`:
+```
+MIN_POSITION_VALUE_USD=5.00  # Sell positions worth less than this
+```
+
+**Example Output:**
+```
+💵 Current USD Balance: $51.52
+🗑️  Positions to sell: 17
+✅ Successful sales: 13
+💰 New USD Balance: $81.34
+```
+
+See **[PORTFOLIO_CLEANUP.md](PORTFOLIO_CLEANUP.md)** for detailed documentation.
+
+### Portfolio Viewer
+
+View your current portfolio balances:
+```bash
+python show_portfolio.py
+```
+
+### Sell Specific Asset
+
+Sell all of a specific cryptocurrency:
+```bash
+python sell_sushi.py  # Example: sells all SUSHI
+```
+
 ## Support
 
 For issues related to:
@@ -415,3 +463,4 @@ For issues related to:
 - **JavaScript technicalindicators**: Check [technicalindicators GitHub](https://github.com/anandanand84/technicalindicators)
 - **Bot Logic**: Review the code and modify as needed for your use case
 - **Deployment**: See [DEPLOYMENT.md](DEPLOYMENT.md) for cloud deployment help
+- **Portfolio Cleanup**: See [PORTFOLIO_CLEANUP.md](PORTFOLIO_CLEANUP.md) for cleanup script details
