@@ -22,7 +22,8 @@ COPY *.py ./
 ENV PYTHONUNBUFFERED=1
 
 # Default command (can be overridden)
+# Using multi-symbol bot to trade ETH and BTC simultaneously
 # For production: use --execute flag
 # For testing: use --sandbox or --test flags
-CMD ["python", "main.py", "--execute"]
+CMD ["python", "main_multi_symbol.py", "--execute"]
 
