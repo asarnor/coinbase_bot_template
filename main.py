@@ -18,6 +18,7 @@ leverage = int(os.getenv('TRADING_LEVERAGE', '5'))     # 5x Leverage (for future
 risk_pct = float(os.getenv('TRADING_RISK_PCT', '0.20'))  # Invest 20% of account balance
 atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))  # 1.5x Volatility Safety Net
 check_interval = int(os.getenv('TRADING_CHECK_INTERVAL', '60'))  # Check market every N seconds (default: 60)
+min_order_size = float(os.getenv('TRADING_MIN_ORDER_SIZE', '1.00'))  # Minimum order size in USD (Coinbase requires ~$1 minimum)
 
 # --- API KEYS ---
 # Read from environment variables (recommended) or use hardcoded values as fallback
@@ -381,6 +382,13 @@ while True:
             # Trend Filter: Price > EMA 20 AND RSI > 50
             if price > ema_20 and rsi > 50:
                 amount, cost = get_position_size(price)
+                
+                # Check if order meets minimum size requirement
+                if cost < min_order_size:
+                    print(f"⚠️  Order too small: ${cost:.2f} < ${min_order_size:.2f} minimum. Skipping trade.")
+                    print(f"   Increase TRADING_RISK_PCT or add more USD balance to enable trading.")
+                    time.sleep(check_interval)
+                    continue
                 
                 if amount > 0:
                     print(f"🚀 ENTER LONG: Buying {amount:.4f} ETH (Cost: ${cost:.2f})")
