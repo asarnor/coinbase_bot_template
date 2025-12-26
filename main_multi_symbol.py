@@ -27,6 +27,9 @@ risk_pct = float(os.getenv('TRADING_RISK_PCT', '0.20'))
 atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))
 check_interval = int(os.getenv('TRADING_CHECK_INTERVAL', '60'))
 min_order_size = float(os.getenv('TRADING_MIN_ORDER_SIZE', '1.00'))
+profit_target_pct = float(os.getenv('TRADING_PROFIT_TARGET_PCT', '0.03'))  # 3% profit target
+rsi_entry_threshold = float(os.getenv('TRADING_RSI_ENTRY', '55'))  # Stricter RSI entry (default 55)
+min_trend_strength = float(os.getenv('TRADING_MIN_TREND_STRENGTH', '0.01'))  # Minimum 1% distance from EMA
 
 # --- API KEYS ---
 api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
@@ -114,14 +117,16 @@ except Exception as e:
     print(f"⚠️  Could not set leverage automatically: {e}")
 
 # Position tracking - one per symbol
-positions = {}  # {symbol: {'in_position': bool, 'stop': float, 'amount': float}}
+positions = {}  # {symbol: {'in_position': bool, 'stop': float, 'amount': float, 'entry_price': float}}
 
 # Initialize positions for all symbols
 for symbol in symbols:
     positions[symbol] = {
         'in_position': False,
         'trailing_stop_price': 0.0,
-        'position_amount': 0.0
+        'position_amount': 0.0,
+        'entry_price': 0.0,
+        'breakeven_set': False  # Track if stop moved to breakeven
     }
 
 def fetch_data(symbol):
@@ -137,6 +142,14 @@ def analyze_market(df):
     df['ema_20'] = ta.ema(df['close'], length=20)
     df['rsi'] = ta.rsi(df['close'], length=14)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    
+    # Calculate EMA trend (slope)
+    df['ema_slope'] = df['ema_20'].diff(5)  # 5-period change in EMA
+    
+    # Calculate volume metrics
+    df['volume_ma'] = df['volume'].rolling(20).mean()
+    df['volume_ratio'] = df['volume'] / df['volume_ma']
+    
     return df.iloc[-1]
 
 def get_position_size(current_price, symbol):
@@ -155,7 +168,9 @@ def get_position_size(current_price, symbol):
         return 0, 0
 
 print(f"🛡️ Active. Risking {risk_pct*100}% total ({risk_pct*100/len(symbols):.1f}% per symbol) of balance per trade.")
-print(f"📉 Crash Protection: ATR Trailing Stop active.")
+print(f"📉 Crash Protection: ATR Trailing Stop active (ATR × {atr_multiplier})")
+print(f"💰 Profit Target: {profit_target_pct*100:.1f}%")
+print(f"📊 Entry Conditions: RSI > {rsi_entry_threshold}, Trend strength > {min_trend_strength*100:.1f}%, EMA trending up, Volume adequate")
 print(f"⏱️  Check Interval: {check_interval} seconds")
 if enable_trading:
     print(f"⚠️  TRADING ENABLED - Real orders will be executed!")
@@ -175,15 +190,33 @@ while True:
             ema_20 = row['ema_20']
             atr = row['atr']
             rsi = row['rsi']
+            ema_slope = row.get('ema_slope', 0)
+            volume_ratio = row.get('volume_ratio', 1.0)
             
             pos = positions[symbol]
             base_currency = symbol.split('/')[0]
+            
+            # Calculate trend strength (distance from EMA as percentage)
+            trend_strength = abs(price - ema_20) / ema_20 if ema_20 > 0 else 0
             
             print(f"[{base_currency}] Price: ${price:.2f} | RSI: {rsi:.2f} | Stop: ${pos['trailing_stop_price']:.2f} | Position: {'YES' if pos['in_position'] else 'NO'}")
 
             # --- BUY LOGIC ---
             if not pos['in_position']:
-                if price > ema_20 and rsi > 50:
+                # Market condition filters
+                # 1. Price must be above EMA (trend filter)
+                # 2. RSI must be above threshold (momentum filter)
+                # 3. Trend strength must be sufficient (avoid sideways markets)
+                # 4. EMA must be trending up (slope positive)
+                # 5. Volume should be above average (confirmation)
+                
+                price_above_ema = price > ema_20
+                rsi_strong = rsi > rsi_entry_threshold
+                trend_strong_enough = trend_strength >= min_trend_strength
+                ema_trending_up = ema_slope > 0
+                volume_adequate = volume_ratio >= 1.0  # At least average volume
+                
+                if price_above_ema and rsi_strong and trend_strong_enough and ema_trending_up and volume_adequate:
                     amount, cost = get_position_size(price, symbol)
                     
                     if cost < min_order_size:
@@ -205,18 +238,67 @@ while True:
                         
                         pos['trailing_stop_price'] = price - (atr * atr_multiplier)
                         pos['position_amount'] = amount
+                        pos['entry_price'] = price
                         pos['in_position'] = True
+                        pos['breakeven_set'] = False
 
             # --- SAFETY LOGIC ---
             elif pos['in_position']:
-                # Raise Safety Net
+                entry_price = pos['entry_price']
+                profit_pct = (price - entry_price) / entry_price
+                
+                # Calculate profit target price
+                profit_target_price = entry_price * (1 + profit_target_pct)
+                
+                # --- PROFIT TAKING ---
+                if price >= profit_target_price:
+                    print(f"[{base_currency}] 💰 PROFIT TARGET REACHED: {profit_pct*100:.2f}% profit at ${price:.2f}")
+                    
+                    if enable_trading:
+                        try:
+                            order = exchange.create_market_sell_order(symbol, pos['position_amount'])
+                            print(f"[{base_currency}] ✅ Profit-taking sell executed: {order.get('id', 'N/A')}")
+                        except Exception as e:
+                            print(f"[{base_currency}] ❌ Profit-taking sell failed: {e}")
+                    else:
+                        print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
+                    
+                    pos['in_position'] = False
+                    pos['trailing_stop_price'] = 0.0
+                    pos['position_amount'] = 0.0
+                    pos['entry_price'] = 0.0
+                    pos['breakeven_set'] = False
+                    continue
+                
+                # --- BETTER STOP-LOSS MANAGEMENT ---
+                # Raise Safety Net (trailing stop)
                 potential_stop = price - (atr * atr_multiplier)
                 if potential_stop > pos['trailing_stop_price']:
                     pos['trailing_stop_price'] = potential_stop
                 
+                # Move stop to breakeven once in profit (protect capital)
+                if not pos['breakeven_set'] and price > entry_price * 1.01:  # 1% profit
+                    pos['trailing_stop_price'] = max(pos['trailing_stop_price'], entry_price * 1.005)  # 0.5% above entry
+                    pos['breakeven_set'] = True
+                    print(f"[{base_currency}] 🔒 Stop moved to breakeven at ${pos['trailing_stop_price']:.2f}")
+                
+                # Dynamic stop adjustment based on profit
+                # As profit increases, tighten stop to lock in gains
+                if profit_pct > 0.02:  # More than 2% profit
+                    # Move stop to lock in at least 1.5% profit
+                    min_profit_stop = entry_price * 1.015
+                    if pos['trailing_stop_price'] < min_profit_stop:
+                        pos['trailing_stop_price'] = min_profit_stop
+                
+                if profit_pct > 0.05:  # More than 5% profit
+                    # Lock in at least 3% profit
+                    min_profit_stop = entry_price * 1.03
+                    if pos['trailing_stop_price'] < min_profit_stop:
+                        pos['trailing_stop_price'] = min_profit_stop
+                
                 # Crash Protection Trigger
                 if price <= pos['trailing_stop_price']:
-                    print(f"[{base_currency}] 🚨 STOP LOSS TRIGGERED at ${price:.2f}")
+                    print(f"[{base_currency}] 🚨 STOP LOSS TRIGGERED at ${price:.2f} (Entry: ${entry_price:.2f}, P/L: {(profit_pct*100):.2f}%)")
                     
                     if enable_trading:
                         try:
@@ -230,6 +312,8 @@ while True:
                     pos['in_position'] = False
                     pos['trailing_stop_price'] = 0.0
                     pos['position_amount'] = 0.0
+                    pos['entry_price'] = 0.0
+                    pos['breakeven_set'] = False
         
         except Exception as e:
             print(f"[{symbol}] Error: {e}")
