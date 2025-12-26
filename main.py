@@ -97,6 +97,9 @@ try:
         'secret': api_secret,
         'enableRateLimit': True,
         'sandbox': use_sandbox,
+        'options': {
+            'createMarketBuyOrderRequiresPrice': False,  # Coinbase Advanced Trade requires cost instead of amount
+        },
     }
     # Sandbox requires password field (can be empty), production Advanced Trade doesn't need it
     if use_sandbox:
@@ -384,7 +387,8 @@ while True:
                     
                     if enable_trading:
                         try:
-                            order = exchange.create_market_buy_order(symbol, amount)
+                            # Coinbase Advanced Trade requires cost (USD) instead of amount (ETH) for market buys
+                            order = exchange.create_market_buy_order(symbol, cost)  # Pass cost (USD) not amount
                             print(f"✅ Order executed: {order.get('id', 'N/A')}")
                         except Exception as e:
                             print(f"❌ Order failed: {e}")
