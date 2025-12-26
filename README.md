@@ -9,6 +9,7 @@ An automated trading bot for Coinbase Pro/Advanced Trade (available in **Python*
 - **Trailing Stop Loss**: ATR-based trailing stop for crash protection
 - **Leverage Support**: Configurable leverage for futures trading
 - **Real-time Monitoring**: Continuous market analysis with 60-second intervals
+- **Portfolio Cleanup**: Automated script to sell small positions and free up USD for trading
 
 ## Prerequisites
 
