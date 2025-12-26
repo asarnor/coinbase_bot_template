@@ -391,11 +391,12 @@ while True:
                     continue
                 
                 if amount > 0:
-                    print(f"🚀 ENTER LONG: Buying {amount:.4f} ETH (Cost: ${cost:.2f})")
+                    base_currency = symbol.split('/')[0]  # Get base currency (ETH, BTC, etc.)
+                    print(f"🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
                     
                     if enable_trading:
                         try:
-                            # Coinbase Advanced Trade requires cost (USD) instead of amount (ETH) for market buys
+                            # Coinbase Advanced Trade requires cost (USD) instead of amount (base currency) for market buys
                             order = exchange.create_market_buy_order(symbol, cost)  # Pass cost (USD) not amount
                             print(f"✅ Order executed: {order.get('id', 'N/A')}")
                         except Exception as e:
