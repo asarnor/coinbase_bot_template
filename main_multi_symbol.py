@@ -61,6 +61,10 @@ api_passphrase = os.getenv('COINBASE_API_PASSPHRASE', '')
 symbols_str = os.getenv('TRADING_SYMBOLS', 'ETH/USD,BTC/USD')
 symbols = [s.strip() for s in symbols_str.split(',')]
 
+# Re-read limit order settings
+use_limit_orders = os.getenv('TRADING_USE_LIMIT_ORDERS', 'false').lower() == 'true'
+limit_order_offset_pct = float(os.getenv('TRADING_LIMIT_ORDER_OFFSET', '0.001'))  # 0.1% offset
+
 # Convert literal \n strings to actual newlines
 if api_secret and '\\n' in api_secret:
     api_secret = api_secret.replace('\\n', '\n')
@@ -171,6 +175,10 @@ print(f"🛡️ Active. Risking {risk_pct*100}% total ({risk_pct*100/len(symbols
 print(f"📉 Crash Protection: ATR Trailing Stop active (ATR × {atr_multiplier})")
 print(f"💰 Profit Target: {profit_target_pct*100:.1f}%")
 print(f"📊 Entry Conditions: RSI > {rsi_entry_threshold}, Trend strength > {min_trend_strength*100:.1f}%, EMA trending up, Volume adequate")
+if use_limit_orders:
+    print(f"💵 Order Type: LIMIT ORDERS (Maker fees: 0.4% - saves 33% vs market orders)")
+else:
+    print(f"💵 Order Type: MARKET ORDERS (Taker fees: 0.6%)")
 print(f"⏱️  Check Interval: {check_interval} seconds")
 if enable_trading:
     print(f"⚠️  TRADING ENABLED - Real orders will be executed!")
@@ -224,17 +232,54 @@ while True:
                         continue
                     
                     if amount > 0:
-                        print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
-                        
-                        if enable_trading:
-                            try:
-                                order = exchange.create_market_buy_order(symbol, cost)
-                                print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
-                            except Exception as e:
-                                print(f"[{base_currency}] ❌ Order failed: {e}")
-                                continue
+                        if use_limit_orders:
+                            # Use limit order (maker) - lower fees (0.4% vs 0.6%)
+                            limit_price = price * (1 - limit_order_offset_pct)  # Slightly below market for buy
+                            print(f"[{base_currency}] 🚀 ENTER LONG (LIMIT): Buying {amount:.6f} {base_currency} at ${limit_price:.2f} (Cost: ${cost:.2f})")
+                            print(f"[{base_currency}] 💰 Using limit order to save fees (maker fee: 0.4% vs taker: 0.6%)")
+                            
+                            if enable_trading:
+                                try:
+                                    # Create limit buy order
+                                    order = exchange.create_limit_buy_order(symbol, amount, limit_price)
+                                    print(f"[{base_currency}] ✅ Limit order placed: {order.get('id', 'N/A')}")
+                                    print(f"[{base_currency}] ⏳ Waiting for order to fill at ${limit_price:.2f}")
+                                    
+                                    # Wait a bit and check if order filled
+                                    time.sleep(5)
+                                    try:
+                                        order_status = exchange.fetch_order(order.get('id'), symbol)
+                                        if order_status.get('status') == 'closed':
+                                            print(f"[{base_currency}] ✅ Order filled!")
+                                        else:
+                                            print(f"[{base_currency}] ⏳ Order pending, will check next cycle")
+                                    except:
+                                        pass  # Order check failed, continue
+                                except Exception as e:
+                                    print(f"[{base_currency}] ❌ Limit order failed: {e}")
+                                    # Fallback to market order if limit fails
+                                    try:
+                                        print(f"[{base_currency}] 🔄 Falling back to market order...")
+                                        order = exchange.create_market_buy_order(symbol, cost)
+                                        print(f"[{base_currency}] ✅ Market order executed: {order.get('id', 'N/A')}")
+                                    except Exception as e2:
+                                        print(f"[{base_currency}] ❌ Market order also failed: {e2}")
+                                        continue
+                            else:
+                                print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
                         else:
-                            print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
+                            # Use market order (taker) - faster but higher fees
+                            print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
+                            
+                            if enable_trading:
+                                try:
+                                    order = exchange.create_market_buy_order(symbol, cost)
+                                    print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
+                                except Exception as e:
+                                    print(f"[{base_currency}] ❌ Order failed: {e}")
+                                    continue
+                            else:
+                                print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
                         
                         pos['trailing_stop_price'] = price - (atr * atr_multiplier)
                         pos['position_amount'] = amount
@@ -256,10 +301,25 @@ while True:
                     
                     if enable_trading:
                         try:
-                            order = exchange.create_market_sell_order(symbol, pos['position_amount'])
-                            print(f"[{base_currency}] ✅ Profit-taking sell executed: {order.get('id', 'N/A')}")
+                            if use_limit_orders:
+                                # Use limit sell order (maker) - lower fees
+                                limit_sell_price = price * (1 + limit_order_offset_pct)  # Slightly above market for sell
+                                print(f"[{base_currency}] 💰 Using limit order to save fees")
+                                order = exchange.create_limit_sell_order(symbol, pos['position_amount'], limit_sell_price)
+                                print(f"[{base_currency}] ✅ Limit sell order placed: {order.get('id', 'N/A')} at ${limit_sell_price:.2f}")
+                            else:
+                                order = exchange.create_market_sell_order(symbol, pos['position_amount'])
+                                print(f"[{base_currency}] ✅ Profit-taking sell executed: {order.get('id', 'N/A')}")
                         except Exception as e:
                             print(f"[{base_currency}] ❌ Profit-taking sell failed: {e}")
+                            # If limit order fails, try market order
+                            if use_limit_orders:
+                                try:
+                                    print(f"[{base_currency}] 🔄 Falling back to market order...")
+                                    order = exchange.create_market_sell_order(symbol, pos['position_amount'])
+                                    print(f"[{base_currency}] ✅ Market sell executed: {order.get('id', 'N/A')}")
+                                except Exception as e2:
+                                    print(f"[{base_currency}] ❌ Market sell also failed: {e2}")
                     else:
                         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
                     
@@ -302,8 +362,10 @@ while True:
                     
                     if enable_trading:
                         try:
+                            # For stop-loss, use market order for immediate execution (safety first)
+                            # Limit orders might not fill fast enough during crashes
                             order = exchange.create_market_sell_order(symbol, pos['position_amount'])
-                            print(f"[{base_currency}] ✅ Sell order executed: {order.get('id', 'N/A')}")
+                            print(f"[{base_currency}] ✅ Stop-loss sell executed: {order.get('id', 'N/A')}")
                         except Exception as e:
                             print(f"[{base_currency}] ❌ Sell order failed: {e}")
                     else:
