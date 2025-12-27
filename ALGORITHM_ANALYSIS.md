@@ -158,3 +158,4 @@ This strategy struggles in:
 4. Test changes in sandbox
 5. Gradually increase risk as strategy proves itself
 
+

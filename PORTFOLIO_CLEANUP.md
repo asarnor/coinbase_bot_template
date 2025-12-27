@@ -117,3 +117,4 @@ You could add this as a periodic function in `main.py` to run automatically.
 - Add them to `PRIORITY_CURRENCIES` list in the script
 - Or increase `MIN_POSITION_VALUE_USD` threshold
 
+
