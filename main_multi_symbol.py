@@ -27,11 +27,11 @@ risk_pct = float(os.getenv('TRADING_RISK_PCT', '0.20'))
 atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))
 check_interval = int(os.getenv('TRADING_CHECK_INTERVAL', '60'))
 min_order_size = float(os.getenv('TRADING_MIN_ORDER_SIZE', '1.00'))
-profit_target_pct = float(os.getenv('TRADING_PROFIT_TARGET_PCT', '0.03'))  # 3% profit target
+profit_target_pct = float(os.getenv('TRADING_PROFIT_TARGET_PCT', '0.02'))  # 2% profit target (faster profit capture for all)
 rsi_entry_threshold = float(os.getenv('TRADING_RSI_ENTRY', '55'))  # Stricter RSI entry (default 55)
 min_trend_strength = float(os.getenv('TRADING_MIN_TREND_STRENGTH', '0.01'))  # Minimum 1% distance from EMA
-spike_reversal_pct = float(os.getenv('TRADING_SPIKE_REVERSAL_PCT', '0.015'))  # Sell if price drops 1.5% from peak
-min_spike_profit_pct = float(os.getenv('TRADING_MIN_SPIKE_PROFIT', '0.02'))  # Only activate spike detection after 2% profit
+spike_reversal_pct = float(os.getenv('TRADING_SPIKE_REVERSAL_PCT', '0.01'))  # Sell if price drops 1.0% from peak (faster for all)
+min_spike_profit_pct = float(os.getenv('TRADING_MIN_SPIKE_PROFIT', '0.01'))  # Activate spike detection after 1% profit (faster for all)
 
 # --- API KEYS ---
 api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
@@ -177,8 +177,9 @@ def get_position_size(current_price, symbol):
 
 print(f"🛡️ Active. Risking {risk_pct*100}% total ({risk_pct*100/len(symbols):.1f}% per symbol) of balance per trade.")
 print(f"📉 Crash Protection: ATR Trailing Stop active (ATR × {atr_multiplier})")
-print(f"💰 Profit Target: {profit_target_pct*100:.1f}% (Static) + Trailing Target (Dynamic)")
+print(f"💰 Profit Target: {profit_target_pct*100:.1f}% for all assets (faster profit capture to 'insure profits')")
 print(f"📈 Spike Detection: Sell on {spike_reversal_pct*100:.1f}% reversal from peak (after {min_spike_profit_pct*100:.1f}% profit)")
+print(f"⚡ Volatile assets (SHIB): Even faster - 1.5% target, 0.8% spike detection")
 print(f"📊 Entry Conditions: RSI > {rsi_entry_threshold}, Trend strength > {min_trend_strength*100:.1f}%, EMA trending up, Volume adequate")
 if use_limit_orders:
     print(f"💵 Order Type: LIMIT ORDERS (Maker fees: 0.4% - saves 33% vs market orders)")
@@ -220,20 +221,22 @@ while True:
             is_volatile = atr_pct > 0.02  # 2%+ ATR indicates high volatility
             
             # Dynamic parameters based on volatility
+            # All assets now use faster profit capture, volatile assets get even faster
             if is_volatile:
-                # For volatile assets: faster profit capture, tighter spike detection
-                dynamic_spike_reversal = 0.008  # 0.8% drop from peak (faster exit)
-                dynamic_profit_target = 0.015   # 1.5% profit target (faster profit-taking)
+                # For volatile assets (SHIB): even faster profit capture
+                dynamic_spike_reversal = 0.008  # 0.8% drop from peak (very fast exit)
+                dynamic_profit_target = 0.015   # 1.5% profit target (very fast profit-taking)
                 dynamic_atr_multiplier = 2.0    # Wider stop (ATR × 2.0)
                 dynamic_min_spike_profit = 0.01  # Activate spike detection at 1% profit
                 if pos['in_position']:  # Only log when in position to avoid spam
-                    print(f"[{base_currency}] ⚡ Volatile asset detected (ATR: {atr_pct*100:.2f}%) - Using fast profit capture mode")
+                    print(f"[{base_currency}] ⚡ Volatile asset (ATR: {atr_pct*100:.2f}%) - Ultra-fast profit capture: 1.5% target, 0.8% spike")
             else:
-                # Standard settings for less volatile assets
-                dynamic_spike_reversal = spike_reversal_pct
-                dynamic_profit_target = profit_target_pct
-                dynamic_atr_multiplier = atr_multiplier
-                dynamic_min_spike_profit = min_spike_profit_pct
+                # Standard settings for less volatile assets (ETH/BTC/LINK): faster than before
+                # Now uses faster profit capture for all assets to "insure profits"
+                dynamic_spike_reversal = spike_reversal_pct  # 1.0% drop (faster than old 1.5%)
+                dynamic_profit_target = profit_target_pct    # 2.0% target (faster than old 3%)
+                dynamic_atr_multiplier = atr_multiplier       # Standard ATR multiplier
+                dynamic_min_spike_profit = min_spike_profit_pct  # 1.0% activation (faster than old 2%)
             
             print(f"[{base_currency}] Price: ${price:.2f} | RSI: {rsi:.2f} | Stop: ${pos['trailing_stop_price']:.2f} | Position: {'YES' if pos['in_position'] else 'NO'}")
 
@@ -464,9 +467,10 @@ while True:
                     pos['breakeven_set'] = True
                     print(f"[{base_currency}] 🔒 Stop moved to breakeven at ${pos['trailing_stop_price']:.2f}")
                 
-                # Faster profit locking for volatile assets
+                # Faster profit locking for ALL assets (to "insure profits")
+                # All assets now lock profits faster than before
                 if is_volatile:
-                    # For volatile assets: lock profits faster
+                    # For volatile assets (SHIB): lock profits very fast
                     if profit_pct > 0.01:  # 1% profit
                         min_profit_stop = entry_price * 1.005  # Lock 0.5% profit
                         if pos['trailing_stop_price'] < min_profit_stop:
@@ -479,18 +483,25 @@ while True:
                             pos['trailing_stop_price'] = min_profit_stop
                             print(f"[{base_currency}] 🔒 Profit locked: 1.0% at ${pos['trailing_stop_price']:.2f}")
                 else:
-                    # Standard profit locking for less volatile assets
-                    if profit_pct > 0.02:  # More than 2% profit
-                        # Move stop to lock in at least 1.5% profit
-                        min_profit_stop = entry_price * 1.015
+                    # For stable assets (ETH/BTC/LINK): faster profit locking than before
+                    # Now locks profits earlier to "insure profits"
+                    if profit_pct > 0.01:  # 1% profit (NEW - faster than before)
+                        min_profit_stop = entry_price * 1.005  # Lock 0.5% profit (NEW)
                         if pos['trailing_stop_price'] < min_profit_stop:
                             pos['trailing_stop_price'] = min_profit_stop
+                            print(f"[{base_currency}] 🔒 Profit locked: 0.5% at ${pos['trailing_stop_price']:.2f}")
                     
-                    if profit_pct > 0.05:  # More than 5% profit
-                        # Lock in at least 3% profit
-                        min_profit_stop = entry_price * 1.03
+                    if profit_pct > 0.02:  # 2% profit (faster than old 2%)
+                        min_profit_stop = entry_price * 1.01  # Lock 1% profit (faster than old 1.5%)
                         if pos['trailing_stop_price'] < min_profit_stop:
                             pos['trailing_stop_price'] = min_profit_stop
+                            print(f"[{base_currency}] 🔒 Profit locked: 1.0% at ${pos['trailing_stop_price']:.2f}")
+                    
+                    if profit_pct > 0.03:  # 3% profit (faster than old 5%)
+                        min_profit_stop = entry_price * 1.02  # Lock 2% profit (faster than old 3%)
+                        if pos['trailing_stop_price'] < min_profit_stop:
+                            pos['trailing_stop_price'] = min_profit_stop
+                            print(f"[{base_currency}] 🔒 Profit locked: 2.0% at ${pos['trailing_stop_price']:.2f}")
                 
                 # Crash Protection Trigger
                 if price <= pos['trailing_stop_price']:
