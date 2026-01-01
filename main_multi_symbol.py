@@ -212,6 +212,29 @@ while True:
             # Calculate trend strength (distance from EMA as percentage)
             trend_strength = abs(price - ema_20) / ema_20 if ema_20 > 0 else 0
             
+            # Calculate volatility (ATR as percentage of price) for asset-specific adjustments
+            atr_pct = atr / price if price > 0 else 0
+            
+            # Adjust parameters for volatile assets (like SHIB)
+            # High volatility = faster exits, tighter spike detection, wider stops
+            is_volatile = atr_pct > 0.02  # 2%+ ATR indicates high volatility
+            
+            # Dynamic parameters based on volatility
+            if is_volatile:
+                # For volatile assets: faster profit capture, tighter spike detection
+                dynamic_spike_reversal = 0.008  # 0.8% drop from peak (faster exit)
+                dynamic_profit_target = 0.015   # 1.5% profit target (faster profit-taking)
+                dynamic_atr_multiplier = 2.0    # Wider stop (ATR × 2.0)
+                dynamic_min_spike_profit = 0.01  # Activate spike detection at 1% profit
+                if pos['in_position']:  # Only log when in position to avoid spam
+                    print(f"[{base_currency}] ⚡ Volatile asset detected (ATR: {atr_pct*100:.2f}%) - Using fast profit capture mode")
+            else:
+                # Standard settings for less volatile assets
+                dynamic_spike_reversal = spike_reversal_pct
+                dynamic_profit_target = profit_target_pct
+                dynamic_atr_multiplier = atr_multiplier
+                dynamic_min_spike_profit = min_spike_profit_pct
+            
             print(f"[{base_currency}] Price: ${price:.2f} | RSI: {rsi:.2f} | Stop: ${pos['trailing_stop_price']:.2f} | Position: {'YES' if pos['in_position'] else 'NO'}")
 
             # --- BUY LOGIC ---
@@ -286,7 +309,9 @@ while True:
                             else:
                                 print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
                         
-                        pos['trailing_stop_price'] = price - (atr * atr_multiplier)
+                        # Use volatility-adjusted ATR multiplier for initial stop
+                        initial_atr_mult = 2.0 if atr_pct > 0.02 else atr_multiplier
+                        pos['trailing_stop_price'] = price - (atr * initial_atr_mult)
                         pos['position_amount'] = amount
                         pos['entry_price'] = price
                         pos['peak_price'] = price  # Initialize peak price
@@ -308,16 +333,17 @@ while True:
                     if new_target > pos['trailing_profit_target']:
                         pos['trailing_profit_target'] = new_target
                 
-                # Calculate static profit target price (original 3% target)
-                profit_target_price = entry_price * (1 + profit_target_pct)
+                # Calculate profit target price (volatility-adjusted)
+                profit_target_price = entry_price * (1 + dynamic_profit_target)
                 
                 # --- SPIKE DETECTION & REVERSAL CAPTURE ---
                 # If price has spiked up significantly, sell on reversal
                 peak_profit_pct = (pos['peak_price'] - entry_price) / entry_price
                 drop_from_peak_pct = (pos['peak_price'] - price) / pos['peak_price'] if pos['peak_price'] > 0 else 0
                 
+                # Use volatility-adjusted parameters
                 # Only activate spike detection if we've made meaningful profit
-                if peak_profit_pct >= min_spike_profit_pct and drop_from_peak_pct >= spike_reversal_pct:
+                if peak_profit_pct >= dynamic_min_spike_profit and drop_from_peak_pct >= dynamic_spike_reversal:
                     print(f"[{base_currency}] 📉 SPIKE REVERSAL DETECTED: Price dropped {drop_from_peak_pct*100:.2f}% from peak ${pos['peak_price']:.2f}")
                     print(f"[{base_currency}] 💰 Capturing profit: {profit_pct*100:.2f}% (Peak was {peak_profit_pct*100:.2f}%)")
                     
@@ -426,30 +452,45 @@ while True:
                     continue
                 
                 # --- BETTER STOP-LOSS MANAGEMENT ---
-                # Raise Safety Net (trailing stop)
-                potential_stop = price - (atr * atr_multiplier)
+                # Raise Safety Net (trailing stop) - use volatility-adjusted multiplier
+                potential_stop = price - (atr * dynamic_atr_multiplier)
                 if potential_stop > pos['trailing_stop_price']:
                     pos['trailing_stop_price'] = potential_stop
                 
+                # Faster profit locking for volatile assets
                 # Move stop to breakeven once in profit (protect capital)
                 if not pos['breakeven_set'] and price > entry_price * 1.01:  # 1% profit
                     pos['trailing_stop_price'] = max(pos['trailing_stop_price'], entry_price * 1.005)  # 0.5% above entry
                     pos['breakeven_set'] = True
                     print(f"[{base_currency}] 🔒 Stop moved to breakeven at ${pos['trailing_stop_price']:.2f}")
                 
-                # Dynamic stop adjustment based on profit
-                # As profit increases, tighten stop to lock in gains
-                if profit_pct > 0.02:  # More than 2% profit
-                    # Move stop to lock in at least 1.5% profit
-                    min_profit_stop = entry_price * 1.015
-                    if pos['trailing_stop_price'] < min_profit_stop:
-                        pos['trailing_stop_price'] = min_profit_stop
-                
-                if profit_pct > 0.05:  # More than 5% profit
-                    # Lock in at least 3% profit
-                    min_profit_stop = entry_price * 1.03
-                    if pos['trailing_stop_price'] < min_profit_stop:
-                        pos['trailing_stop_price'] = min_profit_stop
+                # Faster profit locking for volatile assets
+                if is_volatile:
+                    # For volatile assets: lock profits faster
+                    if profit_pct > 0.01:  # 1% profit
+                        min_profit_stop = entry_price * 1.005  # Lock 0.5% profit
+                        if pos['trailing_stop_price'] < min_profit_stop:
+                            pos['trailing_stop_price'] = min_profit_stop
+                            print(f"[{base_currency}] 🔒 Profit locked: 0.5% at ${pos['trailing_stop_price']:.2f}")
+                    
+                    if profit_pct > 0.02:  # 2% profit
+                        min_profit_stop = entry_price * 1.01  # Lock 1% profit
+                        if pos['trailing_stop_price'] < min_profit_stop:
+                            pos['trailing_stop_price'] = min_profit_stop
+                            print(f"[{base_currency}] 🔒 Profit locked: 1.0% at ${pos['trailing_stop_price']:.2f}")
+                else:
+                    # Standard profit locking for less volatile assets
+                    if profit_pct > 0.02:  # More than 2% profit
+                        # Move stop to lock in at least 1.5% profit
+                        min_profit_stop = entry_price * 1.015
+                        if pos['trailing_stop_price'] < min_profit_stop:
+                            pos['trailing_stop_price'] = min_profit_stop
+                    
+                    if profit_pct > 0.05:  # More than 5% profit
+                        # Lock in at least 3% profit
+                        min_profit_stop = entry_price * 1.03
+                        if pos['trailing_stop_price'] < min_profit_stop:
+                            pos['trailing_stop_price'] = min_profit_stop
                 
                 # Crash Protection Trigger
                 if price <= pos['trailing_stop_price']:
