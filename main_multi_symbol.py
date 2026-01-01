@@ -30,6 +30,8 @@ min_order_size = float(os.getenv('TRADING_MIN_ORDER_SIZE', '1.00'))
 profit_target_pct = float(os.getenv('TRADING_PROFIT_TARGET_PCT', '0.03'))  # 3% profit target
 rsi_entry_threshold = float(os.getenv('TRADING_RSI_ENTRY', '55'))  # Stricter RSI entry (default 55)
 min_trend_strength = float(os.getenv('TRADING_MIN_TREND_STRENGTH', '0.01'))  # Minimum 1% distance from EMA
+spike_reversal_pct = float(os.getenv('TRADING_SPIKE_REVERSAL_PCT', '0.015'))  # Sell if price drops 1.5% from peak
+min_spike_profit_pct = float(os.getenv('TRADING_MIN_SPIKE_PROFIT', '0.02'))  # Only activate spike detection after 2% profit
 
 # --- API KEYS ---
 api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
@@ -130,7 +132,9 @@ for symbol in symbols:
         'trailing_stop_price': 0.0,
         'position_amount': 0.0,
         'entry_price': 0.0,
-        'breakeven_set': False  # Track if stop moved to breakeven
+        'breakeven_set': False,  # Track if stop moved to breakeven
+        'peak_price': 0.0,  # Track highest price reached (for spike detection)
+        'trailing_profit_target': 0.0  # Dynamic profit target that moves up
     }
 
 def fetch_data(symbol):
@@ -173,7 +177,8 @@ def get_position_size(current_price, symbol):
 
 print(f"🛡️ Active. Risking {risk_pct*100}% total ({risk_pct*100/len(symbols):.1f}% per symbol) of balance per trade.")
 print(f"📉 Crash Protection: ATR Trailing Stop active (ATR × {atr_multiplier})")
-print(f"💰 Profit Target: {profit_target_pct*100:.1f}%")
+print(f"💰 Profit Target: {profit_target_pct*100:.1f}% (Static) + Trailing Target (Dynamic)")
+print(f"📈 Spike Detection: Sell on {spike_reversal_pct*100:.1f}% reversal from peak (after {min_spike_profit_pct*100:.1f}% profit)")
 print(f"📊 Entry Conditions: RSI > {rsi_entry_threshold}, Trend strength > {min_trend_strength*100:.1f}%, EMA trending up, Volume adequate")
 if use_limit_orders:
     print(f"💵 Order Type: LIMIT ORDERS (Maker fees: 0.4% - saves 33% vs market orders)")
@@ -284,6 +289,8 @@ while True:
                         pos['trailing_stop_price'] = price - (atr * atr_multiplier)
                         pos['position_amount'] = amount
                         pos['entry_price'] = price
+                        pos['peak_price'] = price  # Initialize peak price
+                        pos['trailing_profit_target'] = price * (1 + profit_target_pct)  # Initial profit target
                         pos['in_position'] = True
                         pos['breakeven_set'] = False
 
@@ -292,10 +299,60 @@ while True:
                 entry_price = pos['entry_price']
                 profit_pct = (price - entry_price) / entry_price
                 
-                # Calculate profit target price
+                # Track peak price (highest price reached)
+                if price > pos['peak_price']:
+                    pos['peak_price'] = price
+                    # Update trailing profit target: moves up as price increases
+                    # Target is always at least profit_target_pct above entry, but moves up with price
+                    new_target = entry_price * (1 + profit_target_pct) + (price - entry_price) * 0.5
+                    if new_target > pos['trailing_profit_target']:
+                        pos['trailing_profit_target'] = new_target
+                
+                # Calculate static profit target price (original 3% target)
                 profit_target_price = entry_price * (1 + profit_target_pct)
                 
-                # --- PROFIT TAKING ---
+                # --- SPIKE DETECTION & REVERSAL CAPTURE ---
+                # If price has spiked up significantly, sell on reversal
+                peak_profit_pct = (pos['peak_price'] - entry_price) / entry_price
+                drop_from_peak_pct = (pos['peak_price'] - price) / pos['peak_price'] if pos['peak_price'] > 0 else 0
+                
+                # Only activate spike detection if we've made meaningful profit
+                if peak_profit_pct >= min_spike_profit_pct and drop_from_peak_pct >= spike_reversal_pct:
+                    print(f"[{base_currency}] 📉 SPIKE REVERSAL DETECTED: Price dropped {drop_from_peak_pct*100:.2f}% from peak ${pos['peak_price']:.2f}")
+                    print(f"[{base_currency}] 💰 Capturing profit: {profit_pct*100:.2f}% (Peak was {peak_profit_pct*100:.2f}%)")
+                    
+                    if enable_trading:
+                        try:
+                            if use_limit_orders:
+                                limit_sell_price = price * (1 + limit_order_offset_pct)
+                                print(f"[{base_currency}] 💰 Using limit order to save fees")
+                                order = exchange.create_limit_sell_order(symbol, pos['position_amount'], limit_sell_price)
+                                print(f"[{base_currency}] ✅ Limit sell order placed: {order.get('id', 'N/A')} at ${limit_sell_price:.2f}")
+                            else:
+                                order = exchange.create_market_sell_order(symbol, pos['position_amount'])
+                                print(f"[{base_currency}] ✅ Spike reversal sell executed: {order.get('id', 'N/A')}")
+                        except Exception as e:
+                            print(f"[{base_currency}] ❌ Spike reversal sell failed: {e}")
+                            if use_limit_orders:
+                                try:
+                                    print(f"[{base_currency}] 🔄 Falling back to market order...")
+                                    order = exchange.create_market_sell_order(symbol, pos['position_amount'])
+                                    print(f"[{base_currency}] ✅ Market sell executed: {order.get('id', 'N/A')}")
+                                except Exception as e2:
+                                    print(f"[{base_currency}] ❌ Market sell also failed: {e2}")
+                    else:
+                        print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
+                    
+                    pos['in_position'] = False
+                    pos['trailing_stop_price'] = 0.0
+                    pos['position_amount'] = 0.0
+                    pos['entry_price'] = 0.0
+                    pos['peak_price'] = 0.0
+                    pos['trailing_profit_target'] = 0.0
+                    pos['breakeven_set'] = False
+                    continue
+                
+                # --- PROFIT TAKING (Static Target) ---
                 if price >= profit_target_price:
                     print(f"[{base_currency}] 💰 PROFIT TARGET REACHED: {profit_pct*100:.2f}% profit at ${price:.2f}")
                     
@@ -327,6 +384,44 @@ while True:
                     pos['trailing_stop_price'] = 0.0
                     pos['position_amount'] = 0.0
                     pos['entry_price'] = 0.0
+                    pos['peak_price'] = 0.0
+                    pos['trailing_profit_target'] = 0.0
+                    pos['breakeven_set'] = False
+                    continue
+                
+                # --- TRAILING PROFIT TARGET (Dynamic) ---
+                # Also check trailing profit target (moves up with price)
+                if pos['trailing_profit_target'] > 0 and price >= pos['trailing_profit_target']:
+                    print(f"[{base_currency}] 💰 TRAILING PROFIT TARGET REACHED: {profit_pct*100:.2f}% profit at ${price:.2f}")
+                    
+                    if enable_trading:
+                        try:
+                            if use_limit_orders:
+                                limit_sell_price = price * (1 + limit_order_offset_pct)
+                                print(f"[{base_currency}] 💰 Using limit order to save fees")
+                                order = exchange.create_limit_sell_order(symbol, pos['position_amount'], limit_sell_price)
+                                print(f"[{base_currency}] ✅ Limit sell order placed: {order.get('id', 'N/A')} at ${limit_sell_price:.2f}")
+                            else:
+                                order = exchange.create_market_sell_order(symbol, pos['position_amount'])
+                                print(f"[{base_currency}] ✅ Trailing profit sell executed: {order.get('id', 'N/A')}")
+                        except Exception as e:
+                            print(f"[{base_currency}] ❌ Trailing profit sell failed: {e}")
+                            if use_limit_orders:
+                                try:
+                                    print(f"[{base_currency}] 🔄 Falling back to market order...")
+                                    order = exchange.create_market_sell_order(symbol, pos['position_amount'])
+                                    print(f"[{base_currency}] ✅ Market sell executed: {order.get('id', 'N/A')}")
+                                except Exception as e2:
+                                    print(f"[{base_currency}] ❌ Market sell also failed: {e2}")
+                    else:
+                        print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
+                    
+                    pos['in_position'] = False
+                    pos['trailing_stop_price'] = 0.0
+                    pos['position_amount'] = 0.0
+                    pos['entry_price'] = 0.0
+                    pos['peak_price'] = 0.0
+                    pos['trailing_profit_target'] = 0.0
                     pos['breakeven_set'] = False
                     continue
                 
@@ -375,6 +470,8 @@ while True:
                     pos['trailing_stop_price'] = 0.0
                     pos['position_amount'] = 0.0
                     pos['entry_price'] = 0.0
+                    pos['peak_price'] = 0.0
+                    pos['trailing_profit_target'] = 0.0
                     pos['breakeven_set'] = False
         
         except Exception as e:
