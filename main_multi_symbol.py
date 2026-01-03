@@ -27,11 +27,12 @@ risk_pct = float(os.getenv('TRADING_RISK_PCT', '0.20'))
 atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))
 check_interval = int(os.getenv('TRADING_CHECK_INTERVAL', '60'))
 min_order_size = float(os.getenv('TRADING_MIN_ORDER_SIZE', '1.00'))
-profit_target_pct = float(os.getenv('TRADING_PROFIT_TARGET_PCT', '0.02'))  # 2% profit target (faster profit capture for all)
+profit_target_pct = float(os.getenv('TRADING_PROFIT_TARGET_PCT', '0.025'))  # 2.5% profit target (increased to capture more profit)
 rsi_entry_threshold = float(os.getenv('TRADING_RSI_ENTRY', '55'))  # Stricter RSI entry (default 55)
 min_trend_strength = float(os.getenv('TRADING_MIN_TREND_STRENGTH', '0.01'))  # Minimum 1% distance from EMA
-spike_reversal_pct = float(os.getenv('TRADING_SPIKE_REVERSAL_PCT', '0.01'))  # Sell if price drops 1.0% from peak (faster for all)
-min_spike_profit_pct = float(os.getenv('TRADING_MIN_SPIKE_PROFIT', '0.01'))  # Activate spike detection after 1% profit (faster for all)
+spike_reversal_pct = float(os.getenv('TRADING_SPIKE_REVERSAL_PCT', '0.015'))  # Sell if price drops 1.5% from peak (wider to avoid premature exits)
+min_spike_profit_pct = float(os.getenv('TRADING_MIN_SPIKE_PROFIT', '0.015'))  # Activate spike detection after 1.5% profit (let moves develop)
+cooldown_minutes = int(os.getenv('TRADING_COOLDOWN_MINUTES', '5'))  # Cooldown period after exit (avoid quick round trips)
 
 # --- API KEYS ---
 api_key = os.getenv('COINBASE_API_KEY', 'YOUR_API_KEY')
@@ -134,7 +135,8 @@ for symbol in symbols:
         'entry_price': 0.0,
         'breakeven_set': False,  # Track if stop moved to breakeven
         'peak_price': 0.0,  # Track highest price reached (for spike detection)
-        'trailing_profit_target': 0.0  # Dynamic profit target that moves up
+        'trailing_profit_target': 0.0,  # Dynamic profit target that moves up
+        'last_exit_time': 0  # Track last exit time for cooldown
     }
 
 def fetch_data(symbol):
@@ -177,9 +179,10 @@ def get_position_size(current_price, symbol):
 
 print(f"🛡️ Active. Risking {risk_pct*100}% total ({risk_pct*100/len(symbols):.1f}% per symbol) of balance per trade.")
 print(f"📉 Crash Protection: ATR Trailing Stop active (ATR × {atr_multiplier})")
-print(f"💰 Profit Target: {profit_target_pct*100:.1f}% for all assets (faster profit capture to 'insure profits')")
+print(f"💰 Profit Target: {profit_target_pct*100:.1f}% for ETH/BTC/LINK, 2.0% for SHIB (optimized for more profit)")
 print(f"📈 Spike Detection: Sell on {spike_reversal_pct*100:.1f}% reversal from peak (after {min_spike_profit_pct*100:.1f}% profit)")
-print(f"⚡ Volatile assets (SHIB): Even faster - 1.5% target, 0.8% spike detection")
+print(f"⚡ Volatile assets (SHIB): 2.0% target, 1.2% spike detection")
+print(f"⏸️  Cooldown Period: {cooldown_minutes} minutes after exit (avoid quick round trips)")
 print(f"📊 Entry Conditions: RSI > {rsi_entry_threshold}, Trend strength > {min_trend_strength*100:.1f}%, EMA trending up, Volume adequate")
 if use_limit_orders:
     print(f"💵 Order Type: LIMIT ORDERS (Maker fees: 0.4% - saves 33% vs market orders)")
@@ -221,27 +224,34 @@ while True:
             is_volatile = atr_pct > 0.02  # 2%+ ATR indicates high volatility
             
             # Dynamic parameters based on volatility
-            # All assets now use faster profit capture, volatile assets get even faster
+            # Adjusted to capture more profit while still protecting gains
             if is_volatile:
-                # For volatile assets (SHIB): even faster profit capture
-                dynamic_spike_reversal = 0.008  # 0.8% drop from peak (very fast exit)
-                dynamic_profit_target = 0.015   # 1.5% profit target (very fast profit-taking)
+                # For volatile assets (SHIB): balanced profit capture
+                dynamic_spike_reversal = 0.012  # 1.2% drop from peak (wider to avoid premature exits)
+                dynamic_profit_target = 0.02    # 2.0% profit target (increased from 1.5%)
                 dynamic_atr_multiplier = 2.0    # Wider stop (ATR × 2.0)
-                dynamic_min_spike_profit = 0.01  # Activate spike detection at 1% profit
+                dynamic_min_spike_profit = 0.015  # Activate spike detection at 1.5% profit (let moves develop)
                 if pos['in_position']:  # Only log when in position to avoid spam
-                    print(f"[{base_currency}] ⚡ Volatile asset (ATR: {atr_pct*100:.2f}%) - Ultra-fast profit capture: 1.5% target, 0.8% spike")
+                    print(f"[{base_currency}] ⚡ Volatile asset (ATR: {atr_pct*100:.2f}%) - Balanced profit capture: 2.0% target, 1.2% spike")
             else:
-                # Standard settings for less volatile assets (ETH/BTC/LINK): faster than before
-                # Now uses faster profit capture for all assets to "insure profits"
-                dynamic_spike_reversal = spike_reversal_pct  # 1.0% drop (faster than old 1.5%)
-                dynamic_profit_target = profit_target_pct    # 2.0% target (faster than old 3%)
+                # Standard settings for less volatile assets (ETH/BTC/LINK): optimized for more profit
+                dynamic_spike_reversal = spike_reversal_pct  # 1.5% drop (wider to avoid premature exits)
+                dynamic_profit_target = profit_target_pct    # 2.5% target (increased from 2%)
                 dynamic_atr_multiplier = atr_multiplier       # Standard ATR multiplier
-                dynamic_min_spike_profit = min_spike_profit_pct  # 1.0% activation (faster than old 2%)
+                dynamic_min_spike_profit = min_spike_profit_pct  # 1.5% activation (let moves develop)
             
             print(f"[{base_currency}] Price: ${price:.2f} | RSI: {rsi:.2f} | Stop: ${pos['trailing_stop_price']:.2f} | Position: {'YES' if pos['in_position'] else 'NO'}")
 
             # --- BUY LOGIC ---
             if not pos['in_position']:
+                # Cooldown check: avoid quick re-entries after exits
+                current_time = time.time()
+                time_since_exit = current_time - pos['last_exit_time'] if pos['last_exit_time'] > 0 else cooldown_minutes * 60 + 1
+                
+                if time_since_exit < cooldown_minutes * 60:
+                    # Still in cooldown period, skip entry
+                    continue
+                
                 # Market condition filters
                 # 1. Price must be above EMA (trend filter)
                 # 2. RSI must be above threshold (momentum filter)
@@ -332,7 +342,8 @@ while True:
                     pos['peak_price'] = price
                     # Update trailing profit target: moves up as price increases
                     # Target is always at least profit_target_pct above entry, but moves up with price
-                    new_target = entry_price * (1 + profit_target_pct) + (price - entry_price) * 0.5
+                    # More aggressive trailing: moves up faster to capture more profit
+                    new_target = entry_price * (1 + profit_target_pct) + (price - entry_price) * 0.6  # Increased from 0.5 to 0.6
                     if new_target > pos['trailing_profit_target']:
                         pos['trailing_profit_target'] = new_target
                 
@@ -379,6 +390,7 @@ while True:
                     pos['peak_price'] = 0.0
                     pos['trailing_profit_target'] = 0.0
                     pos['breakeven_set'] = False
+                    pos['last_exit_time'] = time.time()  # Record exit time for cooldown
                     continue
                 
                 # --- PROFIT TAKING (Static Target) ---
@@ -416,6 +428,7 @@ while True:
                     pos['peak_price'] = 0.0
                     pos['trailing_profit_target'] = 0.0
                     pos['breakeven_set'] = False
+                    pos['last_exit_time'] = time.time()  # Record exit time for cooldown
                     continue
                 
                 # --- TRAILING PROFIT TARGET (Dynamic) ---
@@ -452,6 +465,7 @@ while True:
                     pos['peak_price'] = 0.0
                     pos['trailing_profit_target'] = 0.0
                     pos['breakeven_set'] = False
+                    pos['last_exit_time'] = time.time()  # Record exit time for cooldown
                     continue
                 
                 # --- BETTER STOP-LOSS MANAGEMENT ---
