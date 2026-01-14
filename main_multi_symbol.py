@@ -27,11 +27,11 @@ risk_pct = float(os.getenv('TRADING_RISK_PCT', '0.20'))
 atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))
 check_interval = int(os.getenv('TRADING_CHECK_INTERVAL', '60'))
 min_order_size = float(os.getenv('TRADING_MIN_ORDER_SIZE', '1.00'))
-profit_target_pct = float(os.getenv('TRADING_PROFIT_TARGET_PCT', '0.025'))  # 2.5% profit target (increased to capture more profit)
+profit_target_pct = float(os.getenv('TRADING_PROFIT_TARGET_PCT', '0.035'))  # 3.5% profit target (increased to capture more profit in uptrends)
 rsi_entry_threshold = float(os.getenv('TRADING_RSI_ENTRY', '55'))  # Stricter RSI entry (default 55)
 min_trend_strength = float(os.getenv('TRADING_MIN_TREND_STRENGTH', '0.01'))  # Minimum 1% distance from EMA
-spike_reversal_pct = float(os.getenv('TRADING_SPIKE_REVERSAL_PCT', '0.015'))  # Sell if price drops 1.5% from peak (wider to avoid premature exits)
-min_spike_profit_pct = float(os.getenv('TRADING_MIN_SPIKE_PROFIT', '0.015'))  # Activate spike detection after 1.5% profit (let moves develop)
+spike_reversal_pct = float(os.getenv('TRADING_SPIKE_REVERSAL_PCT', '0.02'))  # Sell if price drops 2.0% from peak (wider to avoid premature exits)
+min_spike_profit_pct = float(os.getenv('TRADING_MIN_SPIKE_PROFIT', '0.02'))  # Activate spike detection after 2.0% profit (let moves develop)
 cooldown_minutes = int(os.getenv('TRADING_COOLDOWN_MINUTES', '5'))  # Cooldown period after exit (avoid quick round trips)
 
 # --- API KEYS ---
@@ -179,7 +179,7 @@ def get_position_size(current_price, symbol):
 
 print(f"🛡️ Active. Risking {risk_pct*100}% total ({risk_pct*100/len(symbols):.1f}% per symbol) of balance per trade.")
 print(f"📉 Crash Protection: ATR Trailing Stop active (ATR × {atr_multiplier})")
-print(f"💰 Profit Target: {profit_target_pct*100:.1f}% for ETH/BTC/LINK, 2.0% for SHIB (optimized for more profit)")
+print(f"💰 Profit Target: {profit_target_pct*100:.1f}% for ETH/BTC/LINK, 2.0% for SHIB (optimized for more profit in uptrends)")
 print(f"📈 Spike Detection: Sell on {spike_reversal_pct*100:.1f}% reversal from peak (after {min_spike_profit_pct*100:.1f}% profit)")
 print(f"⚡ Volatile assets (SHIB): 2.0% target, 1.2% spike detection")
 print(f"⏸️  Cooldown Period: {cooldown_minutes} minutes after exit (avoid quick round trips)")
@@ -235,10 +235,10 @@ while True:
                     print(f"[{base_currency}] ⚡ Volatile asset (ATR: {atr_pct*100:.2f}%) - Balanced profit capture: 2.0% target, 1.2% spike")
             else:
                 # Standard settings for less volatile assets (ETH/BTC/LINK): optimized for more profit
-                dynamic_spike_reversal = spike_reversal_pct  # 1.5% drop (wider to avoid premature exits)
-                dynamic_profit_target = profit_target_pct    # 2.5% target (increased from 2%)
+                dynamic_spike_reversal = spike_reversal_pct  # 2.0% drop (wider to avoid premature exits)
+                dynamic_profit_target = profit_target_pct    # 3.5% target (increased to capture more in uptrends)
                 dynamic_atr_multiplier = atr_multiplier       # Standard ATR multiplier
-                dynamic_min_spike_profit = min_spike_profit_pct  # 1.5% activation (let moves develop)
+                dynamic_min_spike_profit = min_spike_profit_pct  # 2.0% activation (let moves develop)
             
             print(f"[{base_currency}] Price: ${price:.2f} | RSI: {rsi:.2f} | Stop: ${pos['trailing_stop_price']:.2f} | Position: {'YES' if pos['in_position'] else 'NO'}")
 
