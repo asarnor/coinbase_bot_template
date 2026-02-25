@@ -26,7 +26,7 @@ if not api_key or not api_secret:
 # Configuration
 MIN_POSITION_VALUE_USD = float(os.getenv('MIN_POSITION_VALUE_USD', '5.00'))  # Sell positions worth less than this
 EXCLUDE_CURRENCIES = ['USD', 'USDC']  # Don't sell these
-PRIORITY_CURRENCIES = ['BTC', 'ETH']  # Keep these even if small
+PRIORITY_CURRENCIES = ['BTC', 'ETH', 'LINK', 'SHIB']  # Keep these even if small (core holdings)
 
 print("=" * 70)
 print("PORTFOLIO CLEANUP - SELL SMALL POSITIONS FOR USD")
