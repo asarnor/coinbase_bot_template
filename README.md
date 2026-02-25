@@ -410,24 +410,34 @@ docker run -e COINBASE_API_KEY=your_key -e COINBASE_API_SECRET=your_secret coinb
 
 ### Portfolio Cleanup Script
 
-The `cleanup_portfolio.py` script automatically analyzes your portfolio and sells small/irrelevant positions to USD, freeing up capital for trading ETH, Bitcoin, and other valuable assets.
+The `cleanup_portfolio.py` script analyzes your portfolio and can sell non-core assets that are either tiny dust positions or historically weak according to strategy backtests.
 
 **Features:**
 - Analyzes all positions and calculates USD values
 - Identifies positions worth less than a minimum threshold (default: $5)
-- Automatically sells small positions to USD
-- Preserves BTC and ETH (priority currencies)
+- Backtests non-core assets to score uptrend profit capture and crash protection
+- Preserves ETH, BTC, LINK, SHIB by default (priority currencies)
 - Only sells free balance (not locked in orders)
+- Dry-run by default; use `--execute` to place real sell orders
 
 **Usage:**
 ```bash
+# Dry-run (recommended)
 python cleanup_portfolio.py
+
+# Execute real sells
+python cleanup_portfolio.py --execute
 ```
 
 **Configuration:**
 Add to `.env`:
 ```
 MIN_POSITION_VALUE_USD=5.00  # Sell positions worth less than this
+PRIORITY_CURRENCIES=ETH,BTC,LINK,SHIB
+HISTORY_VALIDATION_TIMEFRAME=1h
+HISTORY_VALIDATION_LOOKBACK_DAYS=120
+HISTORY_VALIDATION_MIN_BARS=200
+HISTORY_VALIDATION_MIN_SCORE=60
 ```
 
 **Example Output:**
