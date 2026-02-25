@@ -440,6 +440,25 @@ MIN_POSITION_VALUE_USD=5.00  # Sell positions worth less than this
 
 See **[PORTFOLIO_CLEANUP.md](PORTFOLIO_CLEANUP.md)** for detailed documentation.
 
+### Portfolio History Review (KEEP vs SELL-CANDIDATE)
+
+The `validate_portfolio_holdings.py` script reviews **non-core** coins in your Coinbase portfolio (excluding **ETH, BTC, LINK, SHIB**) and:
+- Downloads recent historical candles (via CCXT)
+- Backtests the current algorithm logic to measure profit vs crash-loss protection (drawdown, tail loss, downside capture)
+- Produces a **KEEP / WATCH / SELL_CANDIDATE** report (dry-run by default)
+
+**Usage (report only):**
+
+```bash
+python3 validate_portfolio_holdings.py --timeframe 1h --days 180
+```
+
+**Optional (execute sells):**
+
+```bash
+python3 validate_portfolio_holdings.py --timeframe 1h --days 180 --execute --max-sells 2
+```
+
 ### Portfolio Viewer
 
 View your current portfolio balances:
