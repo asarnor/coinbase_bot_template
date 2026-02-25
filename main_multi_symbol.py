@@ -539,6 +539,7 @@ while True:
                     pos['peak_price'] = 0.0
                     pos['trailing_profit_target'] = 0.0
                     pos['breakeven_set'] = False
+                    pos['last_exit_time'] = time.time()  # Record exit for cooldown
         
         except Exception as e:
             print(f"[{symbol}] Error: {e}")
