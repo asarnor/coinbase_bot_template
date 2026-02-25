@@ -56,6 +56,11 @@ def _format_pct(x: Optional[float]) -> str:
         return "N/A"
     return f"{x*100:>7.2f}%"
 
+def _format_ratio(x: Optional[float]) -> str:
+    if x is None:
+        return "N/A"
+    return f"{x:>7.2f}x"
+
 
 def _timeframe_to_minutes(tf: str) -> Optional[int]:
     tf = tf.strip().lower()
@@ -82,9 +87,9 @@ def _hold_equity_curve(close: pd.Series) -> pd.DataFrame:
 def score_keep_sell(
     *,
     usd_value: float,
-    hold_cagr: float,
+    hold_total_return: float,
     hold_max_dd: float,
-    trade_cagr: float,
+    trade_total_return: float,
     trade_max_dd: float,
     downside_capture: Optional[float],
 ) -> Tuple[str, int, List[str]]:
@@ -95,12 +100,12 @@ def score_keep_sell(
     reasons: List[str] = []
 
     # Focus on *holding* quality for "worth keeping", but reward if strategy materially improves crash-risk.
-    if hold_cagr > 0:
+    if hold_total_return > 0:
         score += 2
-        reasons.append("Positive hold CAGR")
-    elif hold_cagr < -0.10:
+        reasons.append("Positive hold return")
+    elif hold_total_return < -0.20:
         score -= 2
-        reasons.append("Negative hold CAGR")
+        reasons.append("Negative hold return")
 
     if hold_max_dd > -0.40:
         score += 2
@@ -110,6 +115,10 @@ def score_keep_sell(
         reasons.append("Hold drawdown > 60%")
 
     # Does the trading algorithm reduce crash loss vs holding?
+    if trade_total_return > hold_total_return + 0.05:
+        score += 1
+        reasons.append("Trading improves return vs hold")
+
     if trade_max_dd > hold_max_dd:
         score += 1
         reasons.append("Trading reduces drawdown vs hold")
@@ -118,6 +127,7 @@ def score_keep_sell(
         reasons.append("Trading drawdown worse than hold")
 
     if downside_capture is not None:
+        # < 1.0 means the strategy loses less than the underlying on down bars (good).
         if downside_capture < 0.75:
             score += 1
             reasons.append("Good downside capture")
@@ -126,13 +136,16 @@ def score_keep_sell(
             reasons.append("Poor downside capture")
 
     # De-emphasize tiny dust positions (avoid over-optimizing time on them).
-    if usd_value < 10:
+    if 0 < usd_value < 10:
         score -= 1
         reasons.append("Small position")
 
     if score <= -2:
         return "SELL_CANDIDATE", score, reasons
     if score >= 2:
+        if hold_total_return < 0 and trade_total_return < 0:
+            reasons.append("Both hold and trading returns negative")
+            return "WATCH", score, reasons
         return "KEEP", score, reasons
     return "WATCH", score, reasons
 
@@ -232,9 +245,9 @@ def main() -> int:
 
             label, score, reasons = score_keep_sell(
                 usd_value=usd_value,
-                hold_cagr=hold_perf.cagr,
+                hold_total_return=hold_perf.total_return,
                 hold_max_dd=hold_perf.max_drawdown,
-                trade_cagr=strat_perf.cagr,
+                trade_total_return=strat_perf.total_return,
                 trade_max_dd=strat_perf.max_drawdown,
                 downside_capture=strat_perf.downside_capture,
             )
@@ -279,7 +292,7 @@ def main() -> int:
     print("PORTFOLIO HISTORY REVIEW (NON-CORE COINS)")
     print("=" * 100)
     print(
-        f"{'Coin':<8} {'USD':>10}  {'HoldCAGR':>10} {'HoldDD':>10}  {'TradeCAGR':>10} {'TradeDD':>10}  {'DwnCap':>10}  {'Score':>6}  {'Decision':>14}"
+        f"{'Coin':<8} {'USD':>10}  {'HoldRet':>10} {'HoldDD':>10}  {'TradeRet':>10} {'TradeDD':>10}  {'DwnCap':>10}  {'Score':>6}  {'Decision':>14}"
     )
     print("-" * 100)
 
@@ -288,15 +301,15 @@ def main() -> int:
             continue
         coin = r["base"]
         usd = float(r["usd_value"])
-        hold_cagr = float(r["hold"]["cagr"])
+        hold_ret = float(r["hold"]["total_return"])
         hold_dd = float(r["hold"]["max_drawdown"])
-        trade_cagr = float(r["trade"]["cagr"])
+        trade_ret = float(r["trade"]["total_return"])
         trade_dd = float(r["trade"]["max_drawdown"])
         dcap = r["trade"].get("downside_capture", None)
         score = int(r["decision"]["score"])
         label = r["decision"]["label"]
         print(
-            f"{coin:<8} ${usd:>9.2f}  {_format_pct(hold_cagr):>10} {_format_pct(hold_dd):>10}  {_format_pct(trade_cagr):>10} {_format_pct(trade_dd):>10}  {_format_pct(dcap):>10}  {score:>6}  {label:>14}"
+            f"{coin:<8} ${usd:>9.2f}  {_format_pct(hold_ret):>10} {_format_pct(hold_dd):>10}  {_format_pct(trade_ret):>10} {_format_pct(trade_dd):>10}  {_format_ratio(dcap):>10}  {score:>6}  {label:>14}"
         )
 
     sell_list = [r for r in results if r.get("decision", {}).get("label") == "SELL_CANDIDATE"]
