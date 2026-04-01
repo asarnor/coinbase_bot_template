@@ -39,11 +39,15 @@ Railway is the simplest option with a generous free tier and automatic deploymen
      COINBASE_API_KEY=your_api_key_here
      COINBASE_API_SECRET=your_secret_here
      COINBASE_API_PASSPHRASE=your_passphrase_here (if needed)
-     TRADING_SYMBOL=ETH/USD
+     TRADING_SYMBOLS=ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD
+     TRADING_CORE_SYMBOLS=ETH/USD,BTC/USD
+     TRADING_TACTICAL_SYMBOLS=LINK/USD,SHIB/USD
+     TRADING_SPECULATIVE_SYMBOLS=ALGO/USD,FET/USD
+     TRADING_REGIME_SYMBOLS=BTC/USD,ETH/USD
+     TRADING_REGIME_TIMEFRAME=1h
      TRADING_TIMEFRAME=5m
      TRADING_LEVERAGE=5
      TRADING_RISK_PCT=0.20
-     TRADING_ATR_MULTIPLIER=1.5
      TRADING_CHECK_INTERVAL=60
      ```
 
@@ -79,7 +83,7 @@ Render offers a free tier perfect for testing.
    - **Name**: `coinbase-trading-bot`
    - **Environment**: `Python 3`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python main.py --execute`
+   - **Start Command**: `python main_multi_symbol.py --execute`
 
 4. **Add Environment Variables**
    - Scroll to "Environment Variables"
@@ -138,11 +142,15 @@ AWS EC2 gives you full control but requires more setup.
    export COINBASE_API_KEY="your_key"
    export COINBASE_API_SECRET="your_secret"
    export COINBASE_API_PASSPHRASE="your_passphrase"  # if needed
-   export TRADING_SYMBOL="ETH/USD"
+   export TRADING_SYMBOLS="ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD"
+   export TRADING_CORE_SYMBOLS="ETH/USD,BTC/USD"
+   export TRADING_TACTICAL_SYMBOLS="LINK/USD,SHIB/USD"
+   export TRADING_SPECULATIVE_SYMBOLS="ALGO/USD,FET/USD"
+   export TRADING_REGIME_SYMBOLS="BTC/USD,ETH/USD"
+   export TRADING_REGIME_TIMEFRAME="1h"
    export TRADING_TIMEFRAME="5m"
    export TRADING_LEVERAGE="5"
    export TRADING_RISK_PCT="0.20"
-   export TRADING_ATR_MULTIPLIER="1.5"
    export TRADING_CHECK_INTERVAL="60"
    ```
 
@@ -155,7 +163,7 @@ AWS EC2 gives you full control but requires more setup.
    screen -S trading_bot
    
    # Run bot
-   python3 main.py --execute
+   python3 main_multi_symbol.py --execute
    
    # Detach: Press Ctrl+A then D
    # Reattach: screen -r trading_bot
@@ -179,13 +187,17 @@ AWS EC2 gives you full control but requires more setup.
    WorkingDirectory=/home/ubuntu/coinbase_bot_template
    Environment="COINBASE_API_KEY=your_key"
    Environment="COINBASE_API_SECRET=your_secret"
-   Environment="TRADING_SYMBOL=ETH/USD"
+   Environment="TRADING_SYMBOLS=ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD"
+   Environment="TRADING_CORE_SYMBOLS=ETH/USD,BTC/USD"
+   Environment="TRADING_TACTICAL_SYMBOLS=LINK/USD,SHIB/USD"
+   Environment="TRADING_SPECULATIVE_SYMBOLS=ALGO/USD,FET/USD"
+   Environment="TRADING_REGIME_SYMBOLS=BTC/USD,ETH/USD"
+   Environment="TRADING_REGIME_TIMEFRAME=1h"
    Environment="TRADING_TIMEFRAME=5m"
    Environment="TRADING_LEVERAGE=5"
    Environment="TRADING_RISK_PCT=0.20"
-   Environment="TRADING_ATR_MULTIPLIER=1.5"
    Environment="TRADING_CHECK_INTERVAL=60"
-   ExecStart=/usr/bin/python3 /home/ubuntu/coinbase_bot_template/main.py --execute
+   ExecStart=/usr/bin/python3 /home/ubuntu/coinbase_bot_template/main_multi_symbol.py --execute
    Restart=always
    RestartSec=10
    
@@ -260,7 +272,7 @@ docker run -d \
   --name coinbase-bot \
   -e COINBASE_API_KEY=your_key \
   -e COINBASE_API_SECRET=your_secret \
-  -e TRADING_SYMBOL=ETH/USD \
+  -e TRADING_SYMBOLS=ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD \
   coinbase-bot
 ```
 
@@ -353,4 +365,3 @@ Add a simple health check endpoint or use monitoring services:
 - Review bot logs for errors
 - Test locally first with `--sandbox` flag
 - Verify API credentials are correct
-

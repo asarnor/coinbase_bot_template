@@ -244,10 +244,10 @@ To enable real trading, use the `--execute` flag:
 **Python:**
 ```bash
 # Sandbox with real sandbox trades (recommended for final testing)
-python main.py --sandbox --execute
+python main_multi_symbol.py --sandbox --execute
 
 # Production with real trades (USE WITH EXTREME CAUTION!)
-python main.py --execute
+python main_multi_symbol.py --execute
 ```
 
 **JavaScript:**

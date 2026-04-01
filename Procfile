@@ -1,2 +1,1 @@
-worker: python main.py --execute
-
+worker: python main_multi_symbol.py --execute
