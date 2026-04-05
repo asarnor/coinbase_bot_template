@@ -14,6 +14,9 @@ import pandas as pd
 import pandas_ta_classic as ta
 from dotenv import load_dotenv
 
+from portfolio_utils import fetch_portfolio_snapshot
+from trading_journal import TradingJournal
+
 
 def parse_symbol_list(raw_value: str) -> List[str]:
     return [item.strip() for item in raw_value.split(",") if item.strip()]
@@ -352,6 +355,8 @@ regime_timeframe = os.getenv("TRADING_REGIME_TIMEFRAME", "1h")
 
 use_limit_orders = os.getenv("TRADING_USE_LIMIT_ORDERS", "false").lower() == "true"
 limit_order_offset_pct = float(os.getenv("TRADING_LIMIT_ORDER_OFFSET", "0.001"))
+log_signal_checks = os.getenv("TRADING_LOG_SIGNAL_CHECKS", "true").lower() == "true"
+snapshot_interval_minutes = int(os.getenv("TRADING_PORTFOLIO_SNAPSHOT_MINUTES", "30"))
 
 core_symbols = set(parse_symbol_list(os.getenv("TRADING_CORE_SYMBOLS", "ETH/USD,BTC/USD")))
 tactical_symbols = set(parse_symbol_list(os.getenv("TRADING_TACTICAL_SYMBOLS", "LINK/USD,SHIB/USD")))
@@ -371,6 +376,7 @@ total_risk_weight = sum(symbol_weights.values()) or float(len(symbols) or 1)
 api_key = os.getenv("COINBASE_API_KEY", "YOUR_API_KEY")
 api_secret = os.getenv("COINBASE_API_SECRET", "YOUR_SECRET_KEY")
 api_passphrase = os.getenv("COINBASE_API_PASSPHRASE", "")
+journal = TradingJournal.from_env()
 
 if api_secret and "\\n" in api_secret:
     api_secret = api_secret.replace("\\n", "\n")
@@ -414,6 +420,12 @@ try:
             else:
                 print(f"⚠️  Symbol {symbol} not found")
 except Exception as exc:
+    journal.log_event(
+        "runtime_error",
+        reason="exchange_connection",
+        status="failed",
+        payload={"message": str(exc)},
+    )
     print(f"❌ Connection Error: {exc}")
     sys.exit()
 
@@ -422,6 +434,12 @@ try:
         exchange.set_leverage(leverage, symbol)
     print(f"⚡ Leverage set to {leverage}x for all symbols.")
 except Exception as exc:
+    journal.log_event(
+        "warning",
+        reason="set_leverage_not_supported",
+        status="warning",
+        payload={"message": str(exc)},
+    )
     print(f"⚠️  Could not set leverage automatically: {exc}")
 
 positions = {}
@@ -439,6 +457,11 @@ for symbol in symbols:
 
 print(f"🛡️ Active. Risking {risk_pct * 100:.1f}% total across {len(symbols)} symbols.")
 print(f"🧭 Market regime guardrails use {', '.join(benchmark_symbols)} on {regime_timeframe} candles.")
+print(
+    "🗃️ Journal backend: "
+    f"{journal.describe_backend()}"
+    + ("" if journal.is_persistent() else " (non-persistent unless you add DATABASE_URL)")
+)
 if use_limit_orders:
     print("💵 Order Type: LIMIT ORDERS with market fallback")
 else:
@@ -459,7 +482,38 @@ if enable_trading:
 else:
     print("ℹ️  Trading disabled - orders are simulated (use --execute to enable)")
 
+journal.log_event(
+    "bot_started",
+    status="running",
+    payload={
+        "symbols": symbols,
+        "timeframe": timeframe,
+        "regime_symbols": benchmark_symbols,
+        "risk_pct": risk_pct,
+        "leverage": leverage,
+        "enable_trading": enable_trading,
+        "journal_backend": journal.describe_backend(),
+    },
+)
+
+try:
+    initial_snapshot = fetch_portfolio_snapshot(exchange)
+    journal.log_portfolio_snapshot(
+        total_estimated_usd=initial_snapshot["total_estimated_usd"],
+        free_usd=initial_snapshot["free_usd"],
+        invested_usd=initial_snapshot["invested_usd"],
+        positions=initial_snapshot["positions"],
+    )
+except Exception as exc:
+    journal.log_event(
+        "warning",
+        reason="initial_snapshot_failed",
+        status="warning",
+        payload={"message": str(exc)},
+    )
+
 last_regime_label = None
+last_snapshot_time = time.time()
 
 while True:
     regime_label, regime_snapshots = get_regime_state(exchange, benchmark_symbols, regime_timeframe)
@@ -470,6 +524,12 @@ while True:
                 f"   {benchmark_symbol}: price={format_price(snapshot['price'])} "
                 f"EMA50={format_price(snapshot['ema_50'])} RSI={snapshot['rsi']:.2f}"
             )
+        journal.log_event(
+            "regime_changed",
+            regime=regime_label,
+            status="updated",
+            payload={"snapshots": regime_snapshots},
+        )
         last_regime_label = regime_label
 
     for symbol in symbols:
@@ -514,28 +574,76 @@ while True:
             if not pos["in_position"]:
                 current_time = time.time()
                 time_since_exit = (
-                    current_time - pos["last_exit_time"]
+                current_time - pos["last_exit_time"]
                     if pos["last_exit_time"] > 0
                     else cooldown_minutes * 60 + 1
                 )
-
-                if time_since_exit < cooldown_minutes * 60:
-                    continue
-
-                if regime_label not in profile["allowed_regimes"]:
-                    continue
 
                 price_above_ema = price > ema_20
                 rsi_strong = rsi > profile["rsi_entry_threshold"]
                 trend_strong_enough = trend_strength >= profile["min_trend_strength"]
                 ema_trending_up = ema_slope > 0
                 volume_adequate = volume_ratio >= profile["min_volume_ratio"]
+                cooldown_active = time_since_exit < cooldown_minutes * 60
+                regime_allowed = regime_label in profile["allowed_regimes"]
+                blocked_reasons = []
+
+                if cooldown_active:
+                    blocked_reasons.append("cooldown_active")
+                if not regime_allowed:
+                    blocked_reasons.append("regime_blocked")
+                if not price_above_ema:
+                    blocked_reasons.append("price_below_ema")
+                if not rsi_strong:
+                    blocked_reasons.append("rsi_below_threshold")
+                if not trend_strong_enough:
+                    blocked_reasons.append("trend_too_weak")
+                if not ema_trending_up:
+                    blocked_reasons.append("ema_not_rising")
+                if not volume_adequate:
+                    blocked_reasons.append("volume_below_average")
+
+                if log_signal_checks:
+                    journal.log_event(
+                        "signal_evaluation",
+                        symbol=symbol,
+                        profile=profile_name,
+                        regime=regime_label,
+                        status="entry_ready" if not blocked_reasons else "blocked",
+                        price=price,
+                        payload={
+                            "entry_ready": not blocked_reasons,
+                            "blocked_reasons": blocked_reasons,
+                            "rsi": rsi,
+                            "ema_20": ema_20,
+                            "atr": atr,
+                            "atr_pct": atr_pct,
+                            "trend_strength": trend_strength,
+                            "ema_slope": ema_slope,
+                            "volume_ratio": volume_ratio,
+                            "cooldown_seconds_remaining": max(cooldown_minutes * 60 - time_since_exit, 0),
+                        },
+                    )
+
+                if blocked_reasons:
+                    continue
 
                 if price_above_ema and rsi_strong and trend_strong_enough and ema_trending_up and volume_adequate:
                     risk_slice = risk_pct * symbol_weights[symbol] / total_risk_weight
                     amount, cost = get_position_size(exchange, symbol, price, risk_slice, leverage)
 
                     if cost < min_order_size:
+                        journal.log_event(
+                            "entry_skipped",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            reason="order_below_minimum",
+                            status="skipped",
+                            price=price,
+                            amount=amount,
+                            cost_usd=cost,
+                        )
                         print(
                             f"[{base_currency}] ⚠️  Order too small: "
                             f"${cost:.2f} < ${min_order_size:.2f} minimum. Skipping."
@@ -543,6 +651,15 @@ while True:
                         continue
 
                     if amount <= 0:
+                        journal.log_event(
+                            "entry_skipped",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            reason="no_position_size",
+                            status="skipped",
+                            price=price,
+                        )
                         continue
 
                     entry_executed = place_entry_order(
@@ -564,6 +681,37 @@ while True:
                         pos["trailing_profit_target"] = price * (1 + dynamic_profit_target)
                         pos["in_position"] = True
                         pos["breakeven_set"] = False
+                        journal.log_event(
+                            "entry_executed",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            side="buy",
+                            status="executed",
+                            price=price,
+                            amount=amount,
+                            cost_usd=cost,
+                            payload={
+                                "rsi": rsi,
+                                "atr_pct": atr_pct,
+                                "trend_strength": trend_strength,
+                                "volume_ratio": volume_ratio,
+                                "profit_target_pct": dynamic_profit_target,
+                                "spike_reversal_pct": dynamic_spike_reversal,
+                            },
+                        )
+                    else:
+                        journal.log_event(
+                            "entry_unfilled_or_failed",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            side="buy",
+                            status="pending_or_failed",
+                            price=price,
+                            amount=amount,
+                            cost_usd=cost,
+                        )
 
             else:
                 entry_price = pos["entry_price"]
@@ -609,8 +757,38 @@ while True:
                         enable_trading,
                     )
                     if exit_executed:
+                        journal.log_event(
+                            "exit_executed",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            side="sell",
+                            reason="spike_reversal",
+                            status="executed",
+                            price=price,
+                            amount=pos["position_amount"],
+                            cost_usd=price * pos["position_amount"],
+                            profit_pct=profit_pct,
+                            payload={
+                                "estimated_pnl_usd": (price - entry_price) * pos["position_amount"],
+                                "peak_profit_pct": peak_profit_pct,
+                                "drop_from_peak_pct": drop_from_peak_pct,
+                            },
+                        )
                         reset_position_state(pos, record_exit=True)
                         continue
+                    journal.log_event(
+                        "exit_unfilled_or_failed",
+                        symbol=symbol,
+                        profile=profile_name,
+                        regime=regime_label,
+                        side="sell",
+                        reason="spike_reversal",
+                        status="pending_or_failed",
+                        price=price,
+                        amount=pos["position_amount"],
+                        profit_pct=profit_pct,
+                    )
 
                 profit_target_price = entry_price * (1 + dynamic_profit_target)
                 if price >= profit_target_price:
@@ -629,8 +807,37 @@ while True:
                         enable_trading,
                     )
                     if exit_executed:
+                        journal.log_event(
+                            "exit_executed",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            side="sell",
+                            reason="profit_target",
+                            status="executed",
+                            price=price,
+                            amount=pos["position_amount"],
+                            cost_usd=price * pos["position_amount"],
+                            profit_pct=profit_pct,
+                            payload={
+                                "estimated_pnl_usd": (price - entry_price) * pos["position_amount"],
+                                "target_price": profit_target_price,
+                            },
+                        )
                         reset_position_state(pos, record_exit=True)
                         continue
+                    journal.log_event(
+                        "exit_unfilled_or_failed",
+                        symbol=symbol,
+                        profile=profile_name,
+                        regime=regime_label,
+                        side="sell",
+                        reason="profit_target",
+                        status="pending_or_failed",
+                        price=price,
+                        amount=pos["position_amount"],
+                        profit_pct=profit_pct,
+                    )
 
                 if pos["trailing_profit_target"] > 0 and price >= pos["trailing_profit_target"]:
                     print(
@@ -648,8 +855,37 @@ while True:
                         enable_trading,
                     )
                     if exit_executed:
+                        journal.log_event(
+                            "exit_executed",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            side="sell",
+                            reason="trailing_profit",
+                            status="executed",
+                            price=price,
+                            amount=pos["position_amount"],
+                            cost_usd=price * pos["position_amount"],
+                            profit_pct=profit_pct,
+                            payload={
+                                "estimated_pnl_usd": (price - entry_price) * pos["position_amount"],
+                                "trailing_profit_target": pos["trailing_profit_target"],
+                            },
+                        )
                         reset_position_state(pos, record_exit=True)
                         continue
+                    journal.log_event(
+                        "exit_unfilled_or_failed",
+                        symbol=symbol,
+                        profile=profile_name,
+                        regime=regime_label,
+                        side="sell",
+                        reason="trailing_profit",
+                        status="pending_or_failed",
+                        price=price,
+                        amount=pos["position_amount"],
+                        profit_pct=profit_pct,
+                    )
 
                 potential_stop = price - (atr * dynamic_atr_multiplier)
                 if potential_stop > pos["trailing_stop_price"]:
@@ -694,10 +930,67 @@ while True:
                         force_market=True,
                     )
                     if exit_executed:
+                        journal.log_event(
+                            "exit_executed",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            side="sell",
+                            reason="stop_loss",
+                            status="executed",
+                            price=price,
+                            amount=pos["position_amount"],
+                            cost_usd=price * pos["position_amount"],
+                            profit_pct=profit_pct,
+                            payload={
+                                "estimated_pnl_usd": (price - entry_price) * pos["position_amount"],
+                                "stop_price": pos["trailing_stop_price"],
+                            },
+                        )
                         reset_position_state(pos, record_exit=True)
+                    else:
+                        journal.log_event(
+                            "exit_unfilled_or_failed",
+                            symbol=symbol,
+                            profile=profile_name,
+                            regime=regime_label,
+                            side="sell",
+                            reason="stop_loss",
+                            status="failed",
+                            price=price,
+                            amount=pos["position_amount"],
+                            profit_pct=profit_pct,
+                        )
 
         except Exception as exc:
+            journal.log_event(
+                "runtime_error",
+                symbol=symbol,
+                profile=symbol_profiles.get(symbol),
+                regime=last_regime_label,
+                reason="symbol_loop_exception",
+                status="error",
+                payload={"message": str(exc)},
+            )
             print(f"[{symbol}] Error: {exc}")
             continue
+
+    if snapshot_interval_minutes > 0 and (time.time() - last_snapshot_time) >= snapshot_interval_minutes * 60:
+        try:
+            snapshot = fetch_portfolio_snapshot(exchange)
+            journal.log_portfolio_snapshot(
+                total_estimated_usd=snapshot["total_estimated_usd"],
+                free_usd=snapshot["free_usd"],
+                invested_usd=snapshot["invested_usd"],
+                positions=snapshot["positions"],
+            )
+            last_snapshot_time = time.time()
+        except Exception as exc:
+            journal.log_event(
+                "warning",
+                reason="portfolio_snapshot_failed",
+                status="warning",
+                payload={"message": str(exc)},
+            )
 
     time.sleep(check_interval)

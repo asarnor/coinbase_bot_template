@@ -39,6 +39,7 @@ Railway is the simplest option with a generous free tier and automatic deploymen
      COINBASE_API_KEY=your_api_key_here
      COINBASE_API_SECRET=your_secret_here
      COINBASE_API_PASSPHRASE=your_passphrase_here (if needed)
+     APP_ROLE=bot
      TRADING_SYMBOLS=ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD
      TRADING_CORE_SYMBOLS=ETH/USD,BTC/USD
      TRADING_TACTICAL_SYMBOLS=LINK/USD,SHIB/USD
@@ -49,7 +50,16 @@ Railway is the simplest option with a generous free tier and automatic deploymen
      TRADING_LEVERAGE=5
      TRADING_RISK_PCT=0.20
      TRADING_CHECK_INTERVAL=60
+     TRADING_LOG_SIGNAL_CHECKS=true
+     TRADING_PORTFOLIO_SNAPSHOT_MINUTES=30
+     TRADING_JOURNAL_ENABLED=true
+     REPORT_TIMEZONE=America/Los_Angeles
      ```
+
+   - For persistent journal storage, add a Railway Postgres service and expose its `DATABASE_URL` to the worker.
+   - For daily emails, add `RESEND_API_KEY`, `RESEND_FROM_EMAIL`, and `REPORT_RECIPIENT_EMAILS`.
+   - `RESEND_FROM_EMAIL` must be on a Resend-verified domain. If you want replies to go to a personal inbox, set `REPORT_REPLY_TO` separately.
+   - For a dedicated daily mailer service, set `APP_ROLE=daily_report_email` and configure a Railway cron schedule in UTC. For example, `10 15 * * *` runs at 8:10 AM Los Angeles time during daylight saving time, while `10 16 * * *` runs at 8:10 AM during standard time.
 
 4. **Deploy**
    - Railway will automatically detect the Dockerfile

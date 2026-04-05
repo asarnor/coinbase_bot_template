@@ -21,9 +21,5 @@ COPY *.py ./
 # Set Python to run unbuffered (better for logs)
 ENV PYTHONUNBUFFERED=1
 
-# Default command (can be overridden)
-# Using multi-symbol bot to trade ETH and BTC simultaneously
-# For production: use --execute flag
-# For testing: use --sandbox or --test flags
-CMD ["python", "main_multi_symbol.py", "--execute"]
-
+# Default command routes by APP_ROLE via app_entrypoint.py
+CMD ["python", "app_entrypoint.py"]

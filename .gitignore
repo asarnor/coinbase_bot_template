@@ -51,6 +51,9 @@ config.json
 # Logs
 *.log
 logs/
+reports/
+data/*.db
+*.sqlite3
 
 # Testing
 .pytest_cache/

@@ -1,1 +1,1 @@
-worker: python main_multi_symbol.py --execute
+worker: python app_entrypoint.py

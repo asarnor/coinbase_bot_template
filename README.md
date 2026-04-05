@@ -1,466 +1,425 @@
-# Coinbase Trading Bot Template
+# Coinbase Trading Bot
 
-An automated trading bot for Coinbase Pro/Advanced Trade (available in **Python** and **JavaScript/Node.js**) that uses technical indicators (EMA, RSI, ATR) to execute trading strategies with risk management and trailing stop-loss protection.
+Automated Coinbase Advanced Trade bot with multi-symbol execution, profile-based risk, structured journaling, and daily portfolio reporting.
 
-## Features
+The primary maintained path in this repo is the Python multi-symbol bot in `main_multi_symbol.py`. Legacy single-symbol Python and Node scripts are still included for reference, but the newer journaling, reporting, and Railway deployment flow are built around the Python stack.
 
-- **Technical Analysis**: Uses EMA (20-period), RSI (14-period), and ATR (14-period) indicators
-- **Risk Management**: Configurable position sizing based on account balance percentage
-- **Trailing Stop Loss**: ATR-based trailing stop for crash protection
-- **Leverage Support**: Configurable leverage for futures trading
-- **Real-time Monitoring**: Continuous market analysis with 60-second intervals
-- **Portfolio Cleanup**: Automated script to sell small positions and free up USD for trading
+## Highlights
+
+- Trades multiple symbols from one worker using Coinbase Advanced Trade through CCXT
+- Splits symbols into `core`, `tactical`, and `speculative` profiles with different thresholds and risk weights
+- Applies market-regime guardrails using BTC and ETH on a higher timeframe before allowing entries
+- Uses EMA, RSI, ATR, trend strength, and volume filters to qualify entries
+- Supports profit targets, trailing profit capture, spike-reversal exits, break-even protection, and ATR-based stop-losses
+- Logs structured events for signal checks, blocked reasons, entries, exits, warnings, runtime errors, and portfolio snapshots
+- Stores journal data in SQLite by default or Postgres when `DATABASE_URL` is provided
+- Generates daily markdown reports with transactions, account value, blocked-entry analysis, and current market context
+- Can email reports through Resend
+- Deploys cleanly to Railway through a single app entrypoint that switches behavior by `APP_ROLE`
+
+## Tech Stack
+
+- Python 3.9+
+- [CCXT](https://github.com/ccxt/ccxt) for Coinbase exchange access
+- `pandas` and `pandas-ta-classic` for indicator calculations
+- `python-dotenv` for environment-based configuration
+- SQLite for local journaling
+- Postgres via `psycopg` for persistent production journaling
+- Resend for report email delivery
+- Railway for container deployment and scheduled jobs
+
+## Project Layout
+
+- `main_multi_symbol.py`: primary bot runtime
+- `trading_journal.py`: structured journal for events and portfolio snapshots
+- `portfolio_utils.py`: portfolio valuation and market snapshot helpers
+- `daily_report.py`: markdown report generator and email sender
+- `app_entrypoint.py`: runtime router for Railway services via `APP_ROLE`
+- `show_portfolio.py`: quick balance viewer
+- `cleanup_portfolio.py`: optional script to liquidate very small positions
+- `sell_sushi.py`: one-off utility for liquidating SUSHI holdings
+- `.env.example`, `.env.production.example`, `.env.sandbox.example`: configuration templates
+- `Dockerfile`, `Procfile`, `railway.json`: deployment configuration
+
+## Strategy Overview
+
+The bot scans a symbol list every cycle and only enters when all required filters line up:
+
+- Price is above the short EMA
+- RSI is above the profile threshold
+- Trend strength is high enough
+- EMA slope is positive
+- Volume is strong enough
+- The current market regime allows that profile to trade
+- Cooldown rules are satisfied
+
+Each symbol belongs to one of three profiles:
+
+- `core`: lower-noise majors with steadier thresholds
+- `tactical`: medium-risk names with slightly tighter profit capture
+- `speculative`: higher-risk names that only trade in `risk_on` conditions
+
+The regime engine evaluates benchmark symbols, by default `BTC/USD` and `ETH/USD`, on a higher timeframe and labels the tape as:
+
+- `risk_on`
+- `mixed`
+- `risk_off`
+
+Blocked entry reasons are journaled, which makes it possible to review whether the bot is being selective for good reasons or simply too conservative.
 
 ## Prerequisites
 
-**For Python version:**
-- Python 3.7 or higher
-- Coinbase Pro/Advanced Trade account with API access
-- API credentials (API Key, Secret, and Passphrase)
+- Python 3.9 or higher
+- A Coinbase Advanced Trade account
+- Coinbase API credentials with at least `View` permissions
+- `Trade` permissions if you want the bot to place real orders
 
-**For JavaScript version:**
-- Node.js 15.0 or higher (ES modules support)
-- npm (comes with Node.js)
-- Coinbase Pro/Advanced Trade account with API access
-- API credentials (API Key, Secret, and Passphrase)
+Notes:
 
-## Installation
+- Coinbase Advanced Trade typically uses `COINBASE_API_KEY` and `COINBASE_API_SECRET`
+- `COINBASE_API_PASSPHRASE` is optional and mainly relevant for legacy or sandbox compatibility paths
 
-1. **Clone the repository** (or download the files):
-   ```bash
-   git clone <repository-url>
-   cd coinbase_bot_template
-   ```
+## Quick Start
 
-### Python Version
+1. Clone the repository:
 
-2. **Create a virtual environment** (recommended):
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+```bash
+git clone <your-repo-url>
+cd coinbase_bot_template
+```
 
-3. **Install required dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   
-   Or install manually:
-   ```bash
-   pip install ccxt pandas pandas-ta-classic
-   ```
-   
-   **Note**: We use `pandas-ta-classic` (community fork) as the original `pandas-ta` library is no longer free/open source.
+2. Create and activate a virtual environment:
 
-### JavaScript Version
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
 
-2. **Install Node.js dependencies**:
-   ```bash
-   npm install
-   ```
-   
-   This will install:
-   - `ccxt` - Exchange API library
-   - `technicalindicators` - Technical analysis indicators
-   - `yargs` - Command-line argument parsing
+3. Install dependencies:
 
-**Note**: Both Python and JavaScript versions provide identical functionality. Choose the version you're most comfortable with!
+```bash
+pip install -r requirements.txt
+```
+
+4. Create your environment file:
+
+```bash
+cp .env.example .env
+```
+
+5. Add your Coinbase credentials to `.env`:
+
+```bash
+COINBASE_API_KEY=your_api_key
+COINBASE_API_SECRET=your_secret
+```
+
+6. Start in sandbox or simulated mode first:
+
+```bash
+python main_multi_symbol.py --sandbox
+```
+
+That connects to sandbox credentials if `.env.sandbox` exists, keeps trading disabled, and continuously logs what the bot would do.
 
 ## Configuration
 
-### 1. Get Coinbase API Credentials
+You can run from a single `.env` file or use environment-specific files:
 
-1. Log in to your Coinbase Advanced Trade account (via [Coinbase Developer Platform](https://portal.cdp.coinbase.com/))
-2. Navigate to **API Keys** section
-3. Create an API key with appropriate permissions:
-   - **View** (required)
-   - **Trade** (required for executing orders)
-   - **Transfer** (optional, only if needed)
-4. Save your **API Key** and **Secret** securely
-   - **Note**: Coinbase Advanced Trade API does **not** require a passphrase (unlike legacy Coinbase Pro)
+- `.env`
+- `.env.production`
+- `.env.sandbox`
 
-⚠️ **Important**: Never share your API credentials or commit them to version control.
+Runtime loading behavior:
 
-### 2. Configure the Bot
+- `--sandbox` or `--test` prefers `.env.sandbox`
+- production runs prefer `.env.production`
+- both fall back to `.env`
 
-**Recommended: Use Environment Variables (.env file)**
+### Core Variables
 
-The bot supports environment variables for secure credential storage. You have **three options**:
+| Variable | Purpose | Example / Default |
+| --- | --- | --- |
+| `APP_ROLE` | Selects runtime role for `app_entrypoint.py` | `bot` |
+| `COINBASE_API_KEY` | Coinbase API key | required |
+| `COINBASE_API_SECRET` | Coinbase API secret | required |
+| `COINBASE_API_PASSPHRASE` | Optional passphrase | optional |
+| `TRADING_SYMBOLS` | All tracked symbols | `ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD` |
+| `TRADING_CORE_SYMBOLS` | Symbols assigned to the `core` profile | `ETH/USD,BTC/USD` |
+| `TRADING_TACTICAL_SYMBOLS` | Symbols assigned to the `tactical` profile | `LINK/USD,SHIB/USD` |
+| `TRADING_SPECULATIVE_SYMBOLS` | Symbols assigned to the `speculative` profile | `ALGO/USD,FET/USD` |
+| `TRADING_REGIME_SYMBOLS` | Higher-timeframe benchmark symbols | `BTC/USD,ETH/USD` |
+| `TRADING_REGIME_TIMEFRAME` | Timeframe used for regime detection | `1h` |
+| `TRADING_TIMEFRAME` | Trading timeframe for signal generation | `5m` |
+| `TRADING_LEVERAGE` | Requested leverage setting | `5` |
+| `TRADING_RISK_PCT` | Total portfolio risk allocated across all tracked symbols | `0.20` |
+| `TRADING_CHECK_INTERVAL` | Seconds between cycles | `60` |
+| `TRADING_COOLDOWN_MINUTES` | Cooldown after exits | `5` |
+| `TRADING_MIN_ORDER_SIZE` | Skip entries below this USD value | `1.00` |
+| `TRADING_USE_LIMIT_ORDERS` | Use limit entries/exits with market fallback | `false` |
+| `TRADING_LOG_SIGNAL_CHECKS` | Record blocked-entry reasons | `true` |
+| `TRADING_PORTFOLIO_SNAPSHOT_MINUTES` | Minutes between account snapshots | `30` |
+| `TRADING_JOURNAL_ENABLED` | Enable structured event logging | `true` |
+| `TRADING_JOURNAL_DB_PATH` | Local SQLite path when Postgres is not configured | `data/trading_journal.db` |
+| `DATABASE_URL` | Optional Postgres connection string for persistent journaling | unset by default |
+| `REPORT_TIMEZONE` | Reporting timezone | `America/Los_Angeles` |
+| `REPORT_RECIPIENT_EMAILS` | Comma-separated report recipients | `you@example.com` |
+| `REPORT_SUBJECT_PREFIX` | Email subject prefix | `Coinbase Bot Daily Report` |
+| `REPORT_REPLY_TO` | Reply-to address for reports | optional |
+| `RESEND_API_KEY` | Resend API key | required for email |
+| `RESEND_FROM_EMAIL` | Sender address on a Resend-verified domain | required for email |
+| `REPORT_STDOUT` | Also print the report body to logs | `true` or `false` |
 
-### Option 1: Single .env file (Simplest)
+The profile-specific entry, stop, and profit settings are also exposed in `.env.example`. Use those only after you are comfortable with the default behavior.
 
-Use one `.env` file for both sandbox and production:
+## Running Locally
 
-1. **Copy the example environment file**:
-   ```bash
-   cp .env.example .env
-   ```
+### Simulated Trading
 
-2. **Edit `.env`** and add your API credentials:
-   ```bash
-   COINBASE_API_KEY=your_api_key
-   COINBASE_API_SECRET=your_secret
-   # COINBASE_API_PASSPHRASE=  # Optional - only needed for legacy Coinbase Pro
-   ```
+Production credentials, no real orders:
 
-### Option 2: Separate files for Sandbox and Production (Recommended)
-
-Use different API keys for sandbox vs production:
-
-1. **Copy the example files**:
-   ```bash
-   cp .env.sandbox.example .env.sandbox
-   cp .env.production.example .env.production
-   ```
-
-2. **Edit each file** with the appropriate credentials:
-   - `.env.sandbox` - Your sandbox/test API credentials
-   - `.env.production` - Your production API credentials
-
-3. **The bot automatically loads the correct file**:
-   - When using `--sandbox` or `--test`: loads `.env.sandbox`
-   - When running in production: loads `.env.production`
-   - Falls back to `.env` if environment-specific file doesn't exist
-
-### Option 3: System Environment Variables
-
-Set environment variables directly in your system (useful for CI/CD):
 ```bash
-export COINBASE_API_KEY=your_key
-export COINBASE_API_SECRET=your_secret
-# export COINBASE_API_PASSPHRASE=your_passphrase  # Optional - only for legacy Coinbase Pro
+python main_multi_symbol.py
 ```
 
-**Note**: All `.env*` files are automatically ignored by git (already in `.gitignore`)
+Sandbox credentials, no real orders:
 
-**Alternative: Hardcode in Source Files**
-
-If you prefer not to use `.env` files, you can still configure directly in the source files:
-
-**For Python version**, open `main.py` and update:
-
-```python
-# Trading Configuration
-symbol = 'ETH/USD'       # Trading pair
-timeframe = '5m'         # Candle timeframe
-leverage = 5             # Leverage multiplier
-risk_pct = 0.20          # Risk percentage per trade (20%)
-atr_multiplier = 1.5     # ATR multiplier for stop loss
-check_interval = 60      # Check market every N seconds (default: 60)
-
-# API Credentials
-api_key = 'YOUR_API_KEY'
-api_secret = 'YOUR_SECRET_KEY'
-api_passphrase = 'YOUR_PASSPHRASE'
-```
-
-**For JavaScript version**, open `main.js` and update:
-
-```javascript
-// Trading Configuration
-const symbol = 'ETH/USD';       // Trading pair
-const timeframe = '5m';         // Candle timeframe
-const leverage = 5;             // Leverage multiplier
-const riskPct = 0.20;           // Risk percentage per trade (20%)
-const atrMultiplier = 1.5;      // ATR multiplier for stop loss
-const checkInterval = 60;       // Check market every N seconds (default: 60)
-
-// API Credentials
-const apiKey = 'YOUR_API_KEY';
-const apiSecret = 'YOUR_SECRET_KEY';
-const apiPassphrase = 'YOUR_PASSPHRASE';
-```
-
-**Note**: Environment variables take priority over hardcoded values. If both are set, the `.env` file values will be used.
-
-### 3. Sandbox vs Production
-
-The bot supports command-line flags for easy testing. Use `--sandbox` flag to test in Coinbase's sandbox environment, or `--test` for comprehensive testing (automatically uses sandbox).
-
-⚠️ **Warning**: Always test in sandbox mode first before using real funds!
-
-## Running the Bot
-
-### Test Mode (Recommended First)
-
-Run comprehensive tests to verify connection and functionality:
-
-**Python:**
 ```bash
-python main.py --test
+python main_multi_symbol.py --sandbox
 ```
 
-**JavaScript:**
+### Real Trading
+
+Sandbox with real sandbox orders:
+
 ```bash
-node main.js --test
-# or
-npm test
-```
-
-This will:
-- ✅ Test connection to Coinbase (sandbox mode)
-- ✅ Verify API credentials
-- ✅ Check market data fetching
-- ✅ Test balance retrieval
-- ✅ Test market analysis
-- ✅ Simulate trade execution (dry run)
-
-**See `TESTING.md` for detailed testing instructions.**
-
-### Sandbox Mode (Simulated Trading)
-
-Run the bot in sandbox with simulated trading (no real orders):
-
-**Python:**
-```bash
-python main.py --sandbox
-```
-
-**JavaScript:**
-```bash
-node main.js --sandbox
-# or
-npm run sandbox
-```
-
-The bot will:
-- Connect to Coinbase Pro sandbox
-- Monitor the market every 60 seconds
-- Show entry/exit signals
-- Simulate trades (won't execute real orders)
-- Display price, RSI, and stop-loss levels
-
-### Production Mode
-
-⚠️ **Before enabling production trading:**
-
-1. **Test thoroughly** in sandbox mode (`--test` and `--sandbox`)
-2. **Review the trading logic** and ensure you understand the strategy
-3. **Start with small amounts** to verify behavior
-4. **Monitor closely** during initial runs
-
-To enable real trading, use the `--execute` flag:
-
-**Python:**
-```bash
-# Sandbox with real sandbox trades (recommended for final testing)
 python main_multi_symbol.py --sandbox --execute
+```
 
-# Production with real trades (USE WITH EXTREME CAUTION!)
+Production with real orders:
+
+```bash
 python main_multi_symbol.py --execute
 ```
 
-**JavaScript:**
+### About `--test`
+
+`--test` currently behaves like sandbox mode with a `TEST MODE` banner. It does not exit after one cycle, so treat it as a verbose sandbox run rather than a one-shot smoke test.
+
 ```bash
-# Sandbox with real sandbox trades (recommended for final testing)
-node main.js --sandbox --execute
-
-# Production with real trades (USE WITH EXTREME CAUTION!)
-node main.js --execute
+python main_multi_symbol.py --test
 ```
 
-**Command-line options:**
-- `--test` or `-t` - Run comprehensive tests (auto-enables sandbox)
-- `--sandbox` or `-s` - Use sandbox environment
-- `--execute` or `-e` - Enable actual trade execution (use with caution!)
+## Journal and Daily Reports
 
-## Trading Strategy
+### Journal Backends
 
-The bot implements the following strategy:
+By default, the bot writes to local SQLite:
 
-### Entry Conditions (Long Position)
-- Price is above the 20-period EMA (trend filter)
-- RSI is above 50 (momentum filter)
-
-### Exit Conditions
-- Trailing stop-loss triggered (price drops below ATR-based trailing stop)
-- Stop-loss adjusts upward as price increases (never moves down)
-
-### Risk Management
-- Position size calculated as: `(Account Balance × Risk %) × Leverage`
-- Stop-loss distance: `Current Price - (ATR × Multiplier)`
-
-## Monitoring
-
-The bot outputs real-time information:
-- Current price
-- RSI value
-- Trailing stop-loss price
-- Entry/exit signals
-- Position status
-
-Example output:
-```
-✅ Connected to Coinbase Pro successfully.
-⚡ Leverage set to 5x.
-🛡️ Active. Risking 20.0% of balance per trade.
-📉 Crash Protection: ATR Trailing Stop active.
-⏱️  Check Interval: 60 seconds
-Price: $2450.50 | RSI: 55.30 | Stop: $0.00
-🚀 ENTER LONG: Buying 0.1020 ETH (Cost: $50.00)
-Price: $2460.75 | RSI: 56.20 | Stop: $2435.00
-```
-
-## Troubleshooting
-
-### Connection Errors
-- Verify your API credentials are correct
-- Check that your API key has the required permissions
-- Ensure your IP address is whitelisted (if required by Coinbase)
-- Try using sandbox mode first
-
-### Trading Errors
-- Ensure you have sufficient balance
-- Verify the trading pair symbol is correct (e.g., 'ETH/USD' not 'ETH/USDT')
-- Check that leverage is supported for your account type
-- Review Coinbase's trading limits and restrictions
-
-### Import Errors
-
-**Python:**
-- Ensure all dependencies are installed: `pip install -r requirements.txt`
-- Verify you're using the correct Python version (3.7+)
-- If you see `ModuleNotFoundError: No module named 'pandas_ta'`, ensure you installed `pandas-ta-classic` (the package name in requirements.txt)
-- If you see `ModuleNotFoundError: No module named 'dotenv'`, run `pip install python-dotenv`
-
-**JavaScript:**
-- Ensure all dependencies are installed: `npm install`
-- Verify you're using Node.js 15.0+ (for ES modules support)
-- If you see module errors, try deleting `node_modules` and `package-lock.json`, then run `npm install` again
-- If environment variables aren't loading, ensure you've created a `.env` file from `.env.example`
-
-## Important Disclaimers
-
-⚠️ **Trading Risk Warning**: 
-- Cryptocurrency trading involves substantial risk of loss
-- This bot is provided as a template/example
-- Past performance does not guarantee future results
-- Always test thoroughly before using real funds
-- Never invest more than you can afford to lose
-
-⚠️ **Security Best Practices**:
-- **Use `.env` files** for API credentials (recommended) - they're automatically excluded from git
-- Never commit API credentials to version control
-- Never commit `.env` files (already in `.gitignore`)
-- Use environment variables or secure credential storage
-- Enable 2FA on your Coinbase account
-- Regularly rotate API keys
-- Use IP whitelisting if available
-- Keep your `.env` file secure and never share it
-
-## License
-
-This project is provided as-is for educational purposes. Use at your own risk.
-
-## Testing
-
-For detailed testing instructions, see **[TESTING.md](TESTING.md)** which includes:
-- Step-by-step testing guide
-- Connection testing
-- Trade execution testing (sandbox)
-- Troubleshooting common issues
-
-## Python vs JavaScript Version
-
-Both versions provide **identical functionality**:
-
-| Feature | Python | JavaScript |
-|---------|--------|------------|
-| Technical Indicators | ✅ EMA, RSI, ATR | ✅ EMA, RSI, ATR |
-| Risk Management | ✅ | ✅ |
-| Trailing Stop Loss | ✅ | ✅ |
-| Sandbox Support | ✅ | ✅ |
-| Test Mode | ✅ | ✅ |
-| Command-line Args | ✅ | ✅ |
-
-**Choose based on your preference:**
-- **Python**: Better for data analysis, easier integration with pandas/ML libraries
-- **JavaScript**: Better for web integrations, async/await patterns, Node.js ecosystem
-
-Both versions use the same CCXT library under the hood, so API compatibility is identical.
-
-## Cloud Deployment
-
-Want to run your bot 24/7 in the cloud? We've got you covered!
-
-### Quick Start (5 minutes)
-See **[QUICK_DEPLOY.md](QUICK_DEPLOY.md)** for the fastest deployment options.
-
-### Full Guide
-See **[DEPLOYMENT.md](DEPLOYMENT.md)** for comprehensive deployment instructions including:
-- **Railway** (Recommended - Easiest)
-- **Render** (Free tier available)
-- **AWS EC2** (Full control)
-- **Google Cloud Run** (Serverless)
-- **Docker** (Any platform)
-
-### Docker Support
-The project includes:
-- `Dockerfile` for containerization
-- `docker-compose.yml` for local testing
-- `.dockerignore` for optimized builds
-
-**Quick Docker test:**
 ```bash
-docker build -t coinbase-bot .
-docker run -e COINBASE_API_KEY=your_key -e COINBASE_API_SECRET=your_secret coinbase-bot
+TRADING_JOURNAL_DB_PATH=data/trading_journal.db
 ```
 
-## Additional Tools
+For persistent storage, provide `DATABASE_URL` and the bot will automatically switch to Postgres.
 
-### Portfolio Cleanup Script
+### What Gets Logged
 
-The `cleanup_portfolio.py` script automatically analyzes your portfolio and sells small/irrelevant positions to USD, freeing up capital for trading ETH, Bitcoin, and other valuable assets.
+- bot startup
+- market regime changes
+- signal evaluations
+- blocked entry reasons
+- skipped entries
+- executed entries and exits
+- warnings and runtime errors
+- portfolio snapshots
 
-**Features:**
-- Analyzes all positions and calculates USD values
-- Identifies positions worth less than a minimum threshold (default: $5)
-- Automatically sells small positions to USD
-- Preserves BTC and ETH (priority currencies)
-- Only sells free balance (not locked in orders)
+### Generate Reports
 
-**Usage:**
+Generate a report for today:
+
 ```bash
-python cleanup_portfolio.py
+python daily_report.py --stdout
 ```
 
-**Configuration:**
-Add to `.env`:
-```
-MIN_POSITION_VALUE_USD=5.00  # Sell positions worth less than this
-```
+Generate yesterday's report:
 
-**Example Output:**
-```
-💵 Current USD Balance: $51.52
-🗑️  Positions to sell: 17
-✅ Successful sales: 13
-💰 New USD Balance: $81.34
+```bash
+python daily_report.py --yesterday --stdout
 ```
 
-See **[PORTFOLIO_CLEANUP.md](PORTFOLIO_CLEANUP.md)** for detailed documentation.
+Generate a report for a specific date:
 
-### Portfolio Viewer
+```bash
+python daily_report.py --date 2026-04-04 --stdout
+```
 
-View your current portfolio balances:
+By default, reports are written to:
+
+```text
+reports/daily_report_YYYY-MM-DD.md
+```
+
+### Email Reports
+
+Email yesterday's report:
+
+```bash
+python daily_report.py --yesterday --email
+```
+
+Required email variables:
+
+```bash
+REPORT_RECIPIENT_EMAILS=you@example.com
+RESEND_API_KEY=re_...
+RESEND_FROM_EMAIL=reports@yourdomain.com
+REPORT_REPLY_TO=you@yourmailbox.com
+```
+
+Important:
+
+- `RESEND_FROM_EMAIL` must use a domain verified in Resend
+- personal inbox domains like `gmail.com` or `hotmail.com` will be rejected as the sender
+- if you want replies to land in a personal inbox, use `REPORT_REPLY_TO`
+
+## Helpful Utility Scripts
+
+View balances:
+
 ```bash
 python show_portfolio.py
 ```
 
-### Sell Specific Asset
+Sell small positions below `MIN_POSITION_VALUE_USD`:
 
-Sell all of a specific cryptocurrency:
 ```bash
-python sell_sushi.py  # Example: sells all SUSHI
+python cleanup_portfolio.py
 ```
 
-## Support
+Sell all SUSHI at market:
 
-For issues related to:
-- **Coinbase API**: Check [Coinbase Pro API Documentation](https://docs.pro.coinbase.com/)
-- **CCXT Library**: Check [CCXT Documentation](https://docs.ccxt.com/)
-- **Python pandas-ta-classic**: Check [pandas-ta-classic GitHub](https://github.com/xgboosted/pandas-ta-classic)
-- **JavaScript technicalindicators**: Check [technicalindicators GitHub](https://github.com/anandanand84/technicalindicators)
-- **Bot Logic**: Review the code and modify as needed for your use case
-- **Deployment**: See [DEPLOYMENT.md](DEPLOYMENT.md) for cloud deployment help
-- **Portfolio Cleanup**: See [PORTFOLIO_CLEANUP.md](PORTFOLIO_CLEANUP.md) for cleanup script details
+```bash
+python sell_sushi.py
+```
+
+## Railway Deployment
+
+This repo is set up to deploy through:
+
+- `Dockerfile`
+- `Procfile`
+- `railway.json`
+- `app_entrypoint.py`
+
+The entrypoint chooses behavior by `APP_ROLE`:
+
+- `bot`: runs `main_multi_symbol.py --execute`
+- `daily_report`: generates yesterday's report
+- `daily_report_email`: generates and emails yesterday's report
+
+### Recommended Production Architecture
+
+Use three Railway services:
+
+1. `worker`
+   Runs the live trading bot with `APP_ROLE=bot`
+
+2. `Postgres`
+   Stores persistent journal data
+
+3. `dailyreport`
+   A scheduled job that runs `APP_ROLE=daily_report_email`
+
+### Worker Setup
+
+Minimum worker variables:
+
+```bash
+APP_ROLE=bot
+COINBASE_API_KEY=...
+COINBASE_API_SECRET=...
+TRADING_SYMBOLS=ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD
+TRADING_RISK_PCT=0.20
+TRADING_JOURNAL_ENABLED=true
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+REPORT_TIMEZONE=America/Los_Angeles
+```
+
+Deploy the worker and confirm logs show:
+
+- Coinbase connection success
+- symbol profile assignments
+- current regime
+- `Journal backend: Postgres via DATABASE_URL`
+
+### Daily Report Job Setup
+
+The report service should be configured as a scheduled job, not an always-on worker. It runs once, generates and sends the report, then exits.
+
+Minimum report-job variables:
+
+```bash
+APP_ROLE=daily_report_email
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+COINBASE_API_KEY=${{worker.COINBASE_API_KEY}}
+COINBASE_API_SECRET=${{worker.COINBASE_API_SECRET}}
+COINBASE_API_PASSPHRASE=${{worker.COINBASE_API_PASSPHRASE}}
+TRADING_SYMBOLS=${{worker.TRADING_SYMBOLS}}
+TRADING_JOURNAL_ENABLED=true
+REPORT_TIMEZONE=America/Los_Angeles
+REPORT_RECIPIENT_EMAILS=you@example.com
+REPORT_SUBJECT_PREFIX=Coinbase Bot Daily Report
+RESEND_API_KEY=re_...
+RESEND_FROM_EMAIL=reports@yourdomain.com
+REPORT_REPLY_TO=you@yourmailbox.com
+REPORT_STDOUT=true
+```
+
+### Scheduling
+
+Railway scheduled jobs use UTC.
+
+Examples for `8:10 AM` Los Angeles time:
+
+- daylight saving time: `10 15 * * *`
+- standard time: `10 16 * * *`
+
+If you want the job to run at the same Los Angeles wall-clock time year-round, you will need to adjust the UTC schedule when DST changes.
+
+## Local Docker Run
+
+Build:
+
+```bash
+docker build -t coinbase-bot .
+```
+
+Run the trading worker:
+
+```bash
+docker run --env-file .env coinbase-bot
+```
+
+Run the report generator:
+
+```bash
+docker run --env-file .env -e APP_ROLE=daily_report coinbase-bot
+```
+
+## Legacy Files
+
+These files still exist, but they are not the primary maintained deployment path for the latest features:
+
+- `main.py`: older single-symbol Python bot
+- `main.js`: older Node.js implementation
+- `render.yaml`: legacy deployment example that does not reflect the new `APP_ROLE` flow
+
+If you are starting fresh, use the Python multi-symbol stack documented in this README.
+
+## Safety Notes
+
+- Start with sandbox mode first
+- Do not enable `--execute` until you are comfortable with the symbol list, thresholds, and sizing
+- Review logs after deploys to confirm the bot is actually on the expected journal backend
+- Keep your API keys and `.env` files out of version control
+- No strategy guarantees profits; treat this repo as automation infrastructure, not financial advice
