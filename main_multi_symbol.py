@@ -77,17 +77,26 @@ def analyze_regime(df: pd.DataFrame) -> pd.Series:
     return working.iloc[-1]
 
 
+def env_float(name: str, default: str, fallback_name: str = None) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None and fallback_name:
+        raw_value = os.getenv(fallback_name)
+    if raw_value is None:
+        raw_value = default
+    return float(str(raw_value).strip())
+
+
 def build_profile_settings() -> Dict[str, Dict]:
     return {
         "core": {
             "label": "core",
             "risk_weight": float(os.getenv("TRADING_CORE_RISK_WEIGHT", "1.00")),
-            "profit_target_pct": float(os.getenv("TRADING_CORE_PROFIT_TARGET_PCT", "0.030")),
-            "spike_reversal_pct": float(os.getenv("TRADING_CORE_SPIKE_REVERSAL_PCT", "0.018")),
-            "min_spike_profit_pct": float(os.getenv("TRADING_CORE_MIN_SPIKE_PROFIT", "0.015")),
-            "atr_multiplier": float(os.getenv("TRADING_CORE_ATR_MULTIPLIER", "1.60")),
-            "rsi_entry_threshold": float(os.getenv("TRADING_CORE_RSI_ENTRY", "54")),
-            "min_trend_strength": float(os.getenv("TRADING_CORE_MIN_TREND_STRENGTH", "0.008")),
+            "profit_target_pct": env_float("TRADING_CORE_PROFIT_TARGET_PCT", "0.030", "TRADING_PROFIT_TARGET_PCT"),
+            "spike_reversal_pct": env_float("TRADING_CORE_SPIKE_REVERSAL_PCT", "0.018", "TRADING_SPIKE_REVERSAL_PCT"),
+            "min_spike_profit_pct": env_float("TRADING_CORE_MIN_SPIKE_PROFIT", "0.015", "TRADING_MIN_SPIKE_PROFIT"),
+            "atr_multiplier": env_float("TRADING_CORE_ATR_MULTIPLIER", "1.60", "TRADING_ATR_MULTIPLIER"),
+            "rsi_entry_threshold": env_float("TRADING_CORE_RSI_ENTRY", "54", "TRADING_RSI_ENTRY"),
+            "min_trend_strength": env_float("TRADING_CORE_MIN_TREND_STRENGTH", "0.008", "TRADING_MIN_TREND_STRENGTH"),
             "min_volume_ratio": float(os.getenv("TRADING_CORE_MIN_VOLUME_RATIO", "0.95")),
             "breakeven_trigger_pct": float(os.getenv("TRADING_CORE_BREAKEVEN_TRIGGER", "0.012")),
             "breakeven_lock_pct": float(os.getenv("TRADING_CORE_BREAKEVEN_LOCK", "0.003")),
@@ -106,12 +115,12 @@ def build_profile_settings() -> Dict[str, Dict]:
         "tactical": {
             "label": "tactical",
             "risk_weight": float(os.getenv("TRADING_TACTICAL_RISK_WEIGHT", "0.90")),
-            "profit_target_pct": float(os.getenv("TRADING_TACTICAL_PROFIT_TARGET_PCT", "0.025")),
-            "spike_reversal_pct": float(os.getenv("TRADING_TACTICAL_SPIKE_REVERSAL_PCT", "0.014")),
-            "min_spike_profit_pct": float(os.getenv("TRADING_TACTICAL_MIN_SPIKE_PROFIT", "0.012")),
-            "atr_multiplier": float(os.getenv("TRADING_TACTICAL_ATR_MULTIPLIER", "1.80")),
-            "rsi_entry_threshold": float(os.getenv("TRADING_TACTICAL_RSI_ENTRY", "56")),
-            "min_trend_strength": float(os.getenv("TRADING_TACTICAL_MIN_TREND_STRENGTH", "0.010")),
+            "profit_target_pct": env_float("TRADING_TACTICAL_PROFIT_TARGET_PCT", "0.025", "TRADING_PROFIT_TARGET_PCT"),
+            "spike_reversal_pct": env_float("TRADING_TACTICAL_SPIKE_REVERSAL_PCT", "0.014", "TRADING_SPIKE_REVERSAL_PCT"),
+            "min_spike_profit_pct": env_float("TRADING_TACTICAL_MIN_SPIKE_PROFIT", "0.012", "TRADING_MIN_SPIKE_PROFIT"),
+            "atr_multiplier": env_float("TRADING_TACTICAL_ATR_MULTIPLIER", "1.80", "TRADING_ATR_MULTIPLIER"),
+            "rsi_entry_threshold": env_float("TRADING_TACTICAL_RSI_ENTRY", "56", "TRADING_RSI_ENTRY"),
+            "min_trend_strength": env_float("TRADING_TACTICAL_MIN_TREND_STRENGTH", "0.010", "TRADING_MIN_TREND_STRENGTH"),
             "min_volume_ratio": float(os.getenv("TRADING_TACTICAL_MIN_VOLUME_RATIO", "1.00")),
             "breakeven_trigger_pct": float(os.getenv("TRADING_TACTICAL_BREAKEVEN_TRIGGER", "0.010")),
             "breakeven_lock_pct": float(os.getenv("TRADING_TACTICAL_BREAKEVEN_LOCK", "0.004")),
@@ -130,12 +139,12 @@ def build_profile_settings() -> Dict[str, Dict]:
         "speculative": {
             "label": "speculative",
             "risk_weight": float(os.getenv("TRADING_SPECULATIVE_RISK_WEIGHT", "1.20")),
-            "profit_target_pct": float(os.getenv("TRADING_SPECULATIVE_PROFIT_TARGET_PCT", "0.020")),
-            "spike_reversal_pct": float(os.getenv("TRADING_SPECULATIVE_SPIKE_REVERSAL_PCT", "0.010")),
-            "min_spike_profit_pct": float(os.getenv("TRADING_SPECULATIVE_MIN_SPIKE_PROFIT", "0.010")),
-            "atr_multiplier": float(os.getenv("TRADING_SPECULATIVE_ATR_MULTIPLIER", "2.00")),
-            "rsi_entry_threshold": float(os.getenv("TRADING_SPECULATIVE_RSI_ENTRY", "60")),
-            "min_trend_strength": float(os.getenv("TRADING_SPECULATIVE_MIN_TREND_STRENGTH", "0.015")),
+            "profit_target_pct": env_float("TRADING_SPECULATIVE_PROFIT_TARGET_PCT", "0.020", "TRADING_PROFIT_TARGET_PCT"),
+            "spike_reversal_pct": env_float("TRADING_SPECULATIVE_SPIKE_REVERSAL_PCT", "0.010", "TRADING_SPIKE_REVERSAL_PCT"),
+            "min_spike_profit_pct": env_float("TRADING_SPECULATIVE_MIN_SPIKE_PROFIT", "0.010", "TRADING_MIN_SPIKE_PROFIT"),
+            "atr_multiplier": env_float("TRADING_SPECULATIVE_ATR_MULTIPLIER", "2.00", "TRADING_ATR_MULTIPLIER"),
+            "rsi_entry_threshold": env_float("TRADING_SPECULATIVE_RSI_ENTRY", "60", "TRADING_RSI_ENTRY"),
+            "min_trend_strength": env_float("TRADING_SPECULATIVE_MIN_TREND_STRENGTH", "0.015", "TRADING_MIN_TREND_STRENGTH"),
             "min_volume_ratio": float(os.getenv("TRADING_SPECULATIVE_MIN_VOLUME_RATIO", "1.10")),
             "breakeven_trigger_pct": float(os.getenv("TRADING_SPECULATIVE_BREAKEVEN_TRIGGER", "0.008")),
             "breakeven_lock_pct": float(os.getenv("TRADING_SPECULATIVE_BREAKEVEN_LOCK", "0.004")),
