@@ -14,6 +14,7 @@ import pandas as pd
 import pandas_ta_classic as ta
 from dotenv import load_dotenv
 
+from order_utils import place_entry_order
 from portfolio_utils import fetch_portfolio_snapshot
 from trading_journal import TradingJournal
 
@@ -178,60 +179,6 @@ def resolve_symbol_profile(
     if symbol in {"ETH/USD", "BTC/USD"}:
         return "core"
     return "tactical"
-
-
-def place_entry_order(
-    exchange,
-    symbol: str,
-    base_currency: str,
-    amount: float,
-    cost: float,
-    use_limit_orders: bool,
-    limit_order_offset_pct: float,
-    enable_trading: bool,
-) -> bool:
-    if use_limit_orders:
-        limit_price = exchange.fetch_ticker(symbol)["last"] * (1 - limit_order_offset_pct)
-        print(
-            f"[{base_currency}] 🚀 ENTER LONG (LIMIT): Buying {amount:.6f} {base_currency} "
-            f"at ${limit_price:.2f} (Cost: ${cost:.2f})"
-        )
-        if not enable_trading:
-            print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-            return True
-
-        try:
-            order = exchange.create_limit_buy_order(symbol, amount, limit_price)
-            print(f"[{base_currency}] ✅ Limit order placed: {order.get('id', 'N/A')}")
-            time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
-            if order_status.get("status") == "closed":
-                print(f"[{base_currency}] ✅ Limit order filled")
-                return True
-            print(f"[{base_currency}] ⏳ Limit order still open; waiting for the next cycle")
-            return False
-        except Exception as exc:
-            print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
-            try:
-                order = exchange.create_market_buy_order(symbol, cost)
-                print(f"[{base_currency}] ✅ Fallback market order executed: {order.get('id', 'N/A')}")
-                return True
-            except Exception as fallback_exc:
-                print(f"[{base_currency}] ❌ Market entry also failed: {fallback_exc}")
-                return False
-
-    print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
-    if not enable_trading:
-        print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True
-
-    try:
-        order = exchange.create_market_buy_order(symbol, cost)
-        print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
-        return True
-    except Exception as exc:
-        print(f"[{base_currency}] ❌ Order failed: {exc}")
-        return False
 
 
 def place_exit_order(
