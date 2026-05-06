@@ -1,5 +1,6 @@
 import ast
 import types
+import unittest
 from pathlib import Path
 
 
@@ -59,47 +60,63 @@ class FakeExchange:
         return {"id": "market-sell-1"}
 
 
-def test_unfilled_entry_limit_is_canceled_without_market_fallback():
-    place_entry_order, _ = load_order_helpers()
-    exchange = FakeExchange()
+class LimitOrderCancellationTests(unittest.TestCase):
+    def test_unfilled_entry_limit_is_canceled_without_market_fallback(self):
+        place_entry_order, _ = load_order_helpers()
+        exchange = FakeExchange()
 
-    executed = place_entry_order(exchange, "ETH/USD", "ETH", 0.25, 25.0, True, 0.001, True)
+        executed = place_entry_order(exchange, "ETH/USD", "ETH", 0.25, 25.0, True, 0.001, True)
 
-    assert executed is False
-    assert ("cancel_order", "buy-1", "ETH/USD") in exchange.calls
-    assert not any(call[0] == "create_market_buy_order" for call in exchange.calls)
-
-
-def test_entry_limit_status_error_does_not_submit_duplicate_market_buy():
-    place_entry_order, _ = load_order_helpers()
-    exchange = FakeExchange()
-    exchange.fetch_order_error = RuntimeError("status timeout")
-
-    executed = place_entry_order(exchange, "ETH/USD", "ETH", 0.25, 25.0, True, 0.001, True)
-
-    assert executed is False
-    assert ("cancel_order", "buy-1", "ETH/USD") in exchange.calls
-    assert not any(call[0] == "create_market_buy_order" for call in exchange.calls)
+        self.assertFalse(executed)
+        self.assertIn(("cancel_order", "buy-1", "ETH/USD"), exchange.calls)
+        self.assertFalse(any(call[0] == "create_market_buy_order" for call in exchange.calls))
 
 
-def test_limit_entry_create_failure_still_uses_market_fallback():
-    place_entry_order, _ = load_order_helpers()
-    exchange = FakeExchange()
-    exchange.limit_buy_error = RuntimeError("limit unavailable")
+    def test_entry_limit_status_error_does_not_submit_duplicate_market_buy(self):
+        place_entry_order, _ = load_order_helpers()
+        exchange = FakeExchange()
+        exchange.fetch_order_error = RuntimeError("status timeout")
 
-    executed = place_entry_order(exchange, "ETH/USD", "ETH", 0.25, 25.0, True, 0.001, True)
+        executed = place_entry_order(exchange, "ETH/USD", "ETH", 0.25, 25.0, True, 0.001, True)
 
-    assert executed is True
-    assert ("create_market_buy_order", "ETH/USD", 25.0) in exchange.calls
+        self.assertFalse(executed)
+        self.assertIn(("cancel_order", "buy-1", "ETH/USD"), exchange.calls)
+        self.assertFalse(any(call[0] == "create_market_buy_order" for call in exchange.calls))
 
 
-def test_unfilled_exit_limit_is_canceled_without_market_fallback():
-    _, place_exit_order = load_order_helpers()
-    exchange = FakeExchange()
+    def test_limit_entry_create_failure_still_uses_market_fallback(self):
+        place_entry_order, _ = load_order_helpers()
+        exchange = FakeExchange()
+        exchange.limit_buy_error = RuntimeError("limit unavailable")
 
-    executed = place_exit_order(exchange, "ETH/USD", "ETH", 0.25, "Profit-taking", True, 0.001, True)
+        executed = place_entry_order(exchange, "ETH/USD", "ETH", 0.25, 25.0, True, 0.001, True)
 
-    assert executed is False
-    assert ("cancel_order", "sell-1", "ETH/USD") in exchange.calls
-    assert not any(call[0] == "create_market_sell_order" for call in exchange.calls)
+        self.assertTrue(executed)
+        self.assertIn(("create_market_buy_order", "ETH/USD", 25.0), exchange.calls)
+
+
+    def test_unfilled_exit_limit_is_canceled_without_market_fallback(self):
+        _, place_exit_order = load_order_helpers()
+        exchange = FakeExchange()
+
+        executed = place_exit_order(exchange, "ETH/USD", "ETH", 0.25, "Profit-taking", True, 0.001, True)
+
+        self.assertFalse(executed)
+        self.assertIn(("cancel_order", "sell-1", "ETH/USD"), exchange.calls)
+        self.assertFalse(any(call[0] == "create_market_sell_order" for call in exchange.calls))
+
+    def test_exit_limit_status_error_does_not_submit_duplicate_market_sell(self):
+        _, place_exit_order = load_order_helpers()
+        exchange = FakeExchange()
+        exchange.fetch_order_error = RuntimeError("status timeout")
+
+        executed = place_exit_order(exchange, "ETH/USD", "ETH", 0.25, "Profit-taking", True, 0.001, True)
+
+        self.assertFalse(executed)
+        self.assertIn(("cancel_order", "sell-1", "ETH/USD"), exchange.calls)
+        self.assertFalse(any(call[0] == "create_market_sell_order" for call in exchange.calls))
+
+
+if __name__ == "__main__":
+    unittest.main()
 
