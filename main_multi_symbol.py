@@ -180,6 +180,18 @@ def resolve_symbol_profile(
     return "tactical"
 
 
+def cancel_unfilled_order(exchange, symbol: str, base_currency: str, order_id: str, context: str) -> None:
+    if not order_id:
+        print(f"[{base_currency}] ⚠️  Cannot cancel {context}: missing order id")
+        return
+
+    try:
+        exchange.cancel_order(order_id, symbol)
+        print(f"[{base_currency}] ✅ Canceled unfilled {context}: {order_id}")
+    except Exception as exc:
+        print(f"[{base_currency}] ⚠️  Could not cancel unfilled {context} {order_id}: {exc}")
+
+
 def place_entry_order(
     exchange,
     symbol: str,
@@ -202,14 +214,6 @@ def place_entry_order(
 
         try:
             order = exchange.create_limit_buy_order(symbol, amount, limit_price)
-            print(f"[{base_currency}] ✅ Limit order placed: {order.get('id', 'N/A')}")
-            time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
-            if order_status.get("status") == "closed":
-                print(f"[{base_currency}] ✅ Limit order filled")
-                return True
-            print(f"[{base_currency}] ⏳ Limit order still open; waiting for the next cycle")
-            return False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
             try:
@@ -219,6 +223,22 @@ def place_entry_order(
             except Exception as fallback_exc:
                 print(f"[{base_currency}] ❌ Market entry also failed: {fallback_exc}")
                 return False
+
+        order_id = order.get("id")
+        print(f"[{base_currency}] ✅ Limit order placed: {order_id or 'N/A'}")
+        time.sleep(5)
+        try:
+            order_status = exchange.fetch_order(order_id, symbol)
+        except Exception as exc:
+            print(f"[{base_currency}] ❌ Limit entry status check failed: {exc}")
+            cancel_unfilled_order(exchange, symbol, base_currency, order_id, "entry limit order")
+            return False
+
+        if order_status.get("status") == "closed":
+            print(f"[{base_currency}] ✅ Limit order filled")
+            return True
+        cancel_unfilled_order(exchange, symbol, base_currency, order_id, "entry limit order")
+        return False
 
     print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
     if not enable_trading:
@@ -254,19 +274,27 @@ def place_exit_order(
             last_price = exchange.fetch_ticker(symbol)["last"]
             limit_price = last_price * (1 + limit_order_offset_pct)
             order = exchange.create_limit_sell_order(symbol, amount, limit_price)
+        except Exception as exc:
+            print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
+        else:
+            order_id = order.get("id")
             print(
                 f"[{base_currency}] ✅ {reason} limit order placed: "
-                f"{order.get('id', 'N/A')} at ${limit_price:.2f}"
+                f"{order_id or 'N/A'} at ${limit_price:.2f}"
             )
             time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
+            try:
+                order_status = exchange.fetch_order(order_id, symbol)
+            except Exception as exc:
+                print(f"[{base_currency}] ❌ Limit exit status check failed: {exc}")
+                cancel_unfilled_order(exchange, symbol, base_currency, order_id, "exit limit order")
+                return False
+
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit exit filled")
                 return True
-            print(f"[{base_currency}] ⏳ Exit limit order still open; keeping position state intact")
+            cancel_unfilled_order(exchange, symbol, base_currency, order_id, "exit limit order")
             return False
-        except Exception as exc:
-            print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
 
     try:
         order = exchange.create_market_sell_order(symbol, amount)
@@ -740,11 +768,13 @@ while True:
                 drop_from_peak_pct = (
                     (pos["peak_price"] - price) / pos["peak_price"] if pos["peak_price"] > 0 else 0
                 )
+                exit_signal_attempted = False
 
                 if (
                     peak_profit_pct >= dynamic_min_spike_profit
                     and drop_from_peak_pct >= dynamic_spike_reversal
                 ):
+                    exit_signal_attempted = True
                     print(
                         f"[{base_currency}] 📉 SPIKE REVERSAL DETECTED: "
                         f"Price dropped {drop_from_peak_pct * 100:.2f}% from peak "
@@ -800,7 +830,8 @@ while True:
                     )
 
                 profit_target_price = entry_price * (1 + dynamic_profit_target)
-                if price >= profit_target_price:
+                if not exit_signal_attempted and price >= profit_target_price:
+                    exit_signal_attempted = True
                     print(
                         f"[{base_currency}] 💰 PROFIT TARGET REACHED: "
                         f"{profit_pct * 100:.2f}% profit at {format_price(price)}"
@@ -848,7 +879,12 @@ while True:
                         profit_pct=profit_pct,
                     )
 
-                if pos["trailing_profit_target"] > 0 and price >= pos["trailing_profit_target"]:
+                if (
+                    not exit_signal_attempted
+                    and pos["trailing_profit_target"] > 0
+                    and price >= pos["trailing_profit_target"]
+                ):
+                    exit_signal_attempted = True
                     print(
                         f"[{base_currency}] 💰 TRAILING PROFIT TARGET REACHED: "
                         f"{profit_pct * 100:.2f}% profit at {format_price(price)}"
