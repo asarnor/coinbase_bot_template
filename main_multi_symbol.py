@@ -213,7 +213,7 @@ def place_entry_order(
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
             try:
-                order = exchange.create_market_buy_order(symbol, cost)
+                order = exchange.create_market_buy_order(symbol, amount, {"cost": cost})
                 print(f"[{base_currency}] ✅ Fallback market order executed: {order.get('id', 'N/A')}")
                 return True
             except Exception as fallback_exc:
@@ -226,7 +226,7 @@ def place_entry_order(
         return True
 
     try:
-        order = exchange.create_market_buy_order(symbol, cost)
+        order = exchange.create_market_buy_order(symbol, amount, {"cost": cost})
         print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
         return True
     except Exception as exc:
@@ -328,7 +328,7 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         margin_to_use = free_usd * symbol_risk_slice
         position_value = margin_to_use * leverage
         amount = position_value / current_price if current_price > 0 else 0
-        return amount, margin_to_use
+        return amount, position_value
     except Exception as exc:
         print(f"Balance Error for {symbol}: {exc}")
         return 0, 0
