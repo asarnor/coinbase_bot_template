@@ -46,6 +46,19 @@ def reset_position_state(position: Dict, record_exit: bool = False) -> None:
     position["breakeven_set"] = False
 
 
+def cancel_unfilled_limit_order(exchange, symbol: str, base_currency: str, order: Dict, side: str) -> None:
+    order_id = order.get("id")
+    if not order_id:
+        print(f"[{base_currency}] Could not cancel unfilled limit {side}: missing order id")
+        return
+
+    try:
+        exchange.cancel_order(order_id, symbol)
+        print(f"[{base_currency}] Canceled unfilled limit {side}: {order_id}")
+    except Exception as exc:
+        print(f"[{base_currency}] Could not cancel unfilled limit {side} {order_id}: {exc}")
+
+
 def fetch_data(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -208,7 +221,8 @@ def place_entry_order(
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit order filled")
                 return True
-            print(f"[{base_currency}] ⏳ Limit order still open; waiting for the next cycle")
+            cancel_unfilled_limit_order(exchange, symbol, base_currency, order, "entry")
+            print(f"[{base_currency}] ⏳ Limit order unfilled; waiting for the next cycle")
             return False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
@@ -263,7 +277,8 @@ def place_exit_order(
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit exit filled")
                 return True
-            print(f"[{base_currency}] ⏳ Exit limit order still open; keeping position state intact")
+            cancel_unfilled_limit_order(exchange, symbol, base_currency, order, "exit")
+            print(f"[{base_currency}] ⏳ Exit limit order unfilled; keeping position state intact")
             return False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
@@ -328,7 +343,7 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         margin_to_use = free_usd * symbol_risk_slice
         position_value = margin_to_use * leverage
         amount = position_value / current_price if current_price > 0 else 0
-        return amount, margin_to_use
+        return amount, position_value
     except Exception as exc:
         print(f"Balance Error for {symbol}: {exc}")
         return 0, 0
