@@ -320,6 +320,9 @@ def get_regime_state(exchange, benchmark_symbols: List[str], regime_timeframe: s
 
 def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_slice: float, leverage: int) -> Tuple[float, float]:
     try:
+        if current_price <= 0:
+            return 0, 0
+
         balance = exchange.fetch_balance()
         free_usd = balance.get("USD", {}).get("free", 0)
         if free_usd <= 0:
@@ -327,8 +330,8 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
 
         margin_to_use = free_usd * symbol_risk_slice
         position_value = margin_to_use * leverage
-        amount = position_value / current_price if current_price > 0 else 0
-        return amount, margin_to_use
+        amount = position_value / current_price
+        return amount, position_value
     except Exception as exc:
         print(f"Balance Error for {symbol}: {exc}")
         return 0, 0
