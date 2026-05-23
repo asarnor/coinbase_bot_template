@@ -46,6 +46,32 @@ def reset_position_state(position: Dict, record_exit: bool = False) -> None:
     position["breakeven_set"] = False
 
 
+def order_filled_amount(order: Dict, fallback_amount: float = 0.0) -> float:
+    if not order:
+        return 0.0
+
+    for key in ("filled", "amount"):
+        raw_value = order.get(key)
+        try:
+            filled_amount = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if filled_amount > 0:
+            return filled_amount
+
+    return fallback_amount if order.get("status") == "closed" and fallback_amount > 0 else 0.0
+
+
+def cancel_order_safely(exchange, order_id: str, symbol: str, base_currency: str, action: str) -> None:
+    if not order_id:
+        return
+    try:
+        exchange.cancel_order(order_id, symbol)
+        print(f"[{base_currency}] ✅ Canceled unfilled {action} limit order: {order_id}")
+    except Exception as exc:
+        print(f"[{base_currency}] ⚠️  Could not cancel {action} limit order {order_id}: {exc}")
+
+
 def fetch_data(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -189,7 +215,7 @@ def place_entry_order(
     use_limit_orders: bool,
     limit_order_offset_pct: float,
     enable_trading: bool,
-) -> bool:
+) -> Tuple[bool, float]:
     if use_limit_orders:
         limit_price = exchange.fetch_ticker(symbol)["last"] * (1 - limit_order_offset_pct)
         print(
@@ -198,40 +224,46 @@ def place_entry_order(
         )
         if not enable_trading:
             print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-            return True
+            return True, amount
 
         try:
             order = exchange.create_limit_buy_order(symbol, amount, limit_price)
-            print(f"[{base_currency}] ✅ Limit order placed: {order.get('id', 'N/A')}")
+            order_id = order.get("id")
+            print(f"[{base_currency}] ✅ Limit order placed: {order_id or 'N/A'}")
             time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
+            order_status = exchange.fetch_order(order_id, symbol)
+            filled_amount = order_filled_amount(order_status, amount)
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit order filled")
-                return True
-            print(f"[{base_currency}] ⏳ Limit order still open; waiting for the next cycle")
-            return False
+                return True, filled_amount
+            cancel_order_safely(exchange, order_id, symbol, base_currency, "entry")
+            if filled_amount > 0:
+                print(f"[{base_currency}] ⚠️  Limit order partially filled: {filled_amount:.6f}")
+                return True, filled_amount
+            print(f"[{base_currency}] ⏳ Limit order not filled; canceled before the next cycle")
+            return False, 0.0
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
             try:
                 order = exchange.create_market_buy_order(symbol, cost)
                 print(f"[{base_currency}] ✅ Fallback market order executed: {order.get('id', 'N/A')}")
-                return True
+                return True, order_filled_amount(order, amount) or amount
             except Exception as fallback_exc:
                 print(f"[{base_currency}] ❌ Market entry also failed: {fallback_exc}")
-                return False
+                return False, 0.0
 
     print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True
+        return True, amount
 
     try:
         order = exchange.create_market_buy_order(symbol, cost)
         print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
-        return True
+        return True, order_filled_amount(order, amount) or amount
     except Exception as exc:
         print(f"[{base_currency}] ❌ Order failed: {exc}")
-        return False
+        return False, 0.0
 
 
 def place_exit_order(
@@ -244,37 +276,43 @@ def place_exit_order(
     limit_order_offset_pct: float,
     enable_trading: bool,
     force_market: bool = False,
-) -> bool:
+) -> Tuple[bool, float]:
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True
+        return True, amount
 
     if use_limit_orders and not force_market:
         try:
             last_price = exchange.fetch_ticker(symbol)["last"]
             limit_price = last_price * (1 + limit_order_offset_pct)
             order = exchange.create_limit_sell_order(symbol, amount, limit_price)
+            order_id = order.get("id")
             print(
                 f"[{base_currency}] ✅ {reason} limit order placed: "
-                f"{order.get('id', 'N/A')} at ${limit_price:.2f}"
+                f"{order_id or 'N/A'} at ${limit_price:.2f}"
             )
             time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
+            order_status = exchange.fetch_order(order_id, symbol)
+            filled_amount = order_filled_amount(order_status, amount)
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit exit filled")
-                return True
-            print(f"[{base_currency}] ⏳ Exit limit order still open; keeping position state intact")
-            return False
+                return True, filled_amount
+            cancel_order_safely(exchange, order_id, symbol, base_currency, "exit")
+            if filled_amount > 0:
+                print(f"[{base_currency}] ⚠️  Limit exit partially filled: {filled_amount:.6f}")
+                return False, filled_amount
+            print(f"[{base_currency}] ⏳ Exit limit order not filled; keeping position state intact")
+            return False, 0.0
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
 
     try:
         order = exchange.create_market_sell_order(symbol, amount)
         print(f"[{base_currency}] ✅ {reason} market sell executed: {order.get('id', 'N/A')}")
-        return True
+        return True, order_filled_amount(order, amount) or amount
     except Exception as exc:
         print(f"[{base_currency}] ❌ {reason} sell failed: {exc}")
-        return False
+        return False, 0.0
 
 
 def get_regime_state(exchange, benchmark_symbols: List[str], regime_timeframe: str) -> Tuple[str, Dict[str, Dict]]:
@@ -328,7 +366,7 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         margin_to_use = free_usd * symbol_risk_slice
         position_value = margin_to_use * leverage
         amount = position_value / current_price if current_price > 0 else 0
-        return amount, margin_to_use
+        return amount, position_value
     except Exception as exc:
         print(f"Balance Error for {symbol}: {exc}")
         return 0, 0
@@ -671,7 +709,7 @@ while True:
                         )
                         continue
 
-                    entry_executed = place_entry_order(
+                    entry_executed, filled_amount = place_entry_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -684,7 +722,7 @@ while True:
 
                     if entry_executed:
                         pos["trailing_stop_price"] = price - (atr * dynamic_atr_multiplier)
-                        pos["position_amount"] = amount
+                        pos["position_amount"] = filled_amount
                         pos["entry_price"] = price
                         pos["peak_price"] = price
                         pos["trailing_profit_target"] = price * (1 + dynamic_profit_target)
@@ -698,8 +736,8 @@ while True:
                             side="buy",
                             status="executed",
                             price=price,
-                            amount=amount,
-                            cost_usd=cost,
+                            amount=filled_amount,
+                            cost_usd=price * filled_amount,
                             payload={
                                 "rsi": rsi,
                                 "atr_pct": atr_pct,
@@ -755,7 +793,7 @@ while True:
                         f"(Peak was {peak_profit_pct * 100:.2f}%)"
                     )
 
-                    exit_executed = place_exit_order(
+                    exit_executed, exit_filled_amount = place_exit_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -775,11 +813,11 @@ while True:
                             reason="spike_reversal",
                             status="executed",
                             price=price,
-                            amount=pos["position_amount"],
-                            cost_usd=price * pos["position_amount"],
+                            amount=exit_filled_amount,
+                            cost_usd=price * exit_filled_amount,
                             profit_pct=profit_pct,
                             payload={
-                                "estimated_pnl_usd": (price - entry_price) * pos["position_amount"],
+                                "estimated_pnl_usd": (price - entry_price) * exit_filled_amount,
                                 "peak_profit_pct": peak_profit_pct,
                                 "drop_from_peak_pct": drop_from_peak_pct,
                             },
@@ -798,6 +836,11 @@ while True:
                         amount=pos["position_amount"],
                         profit_pct=profit_pct,
                     )
+                    if exit_filled_amount > 0:
+                        pos["position_amount"] = max(pos["position_amount"] - exit_filled_amount, 0.0)
+                        if pos["position_amount"] <= 0:
+                            reset_position_state(pos, record_exit=True)
+                            continue
 
                 profit_target_price = entry_price * (1 + dynamic_profit_target)
                 if price >= profit_target_price:
@@ -805,7 +848,7 @@ while True:
                         f"[{base_currency}] 💰 PROFIT TARGET REACHED: "
                         f"{profit_pct * 100:.2f}% profit at {format_price(price)}"
                     )
-                    exit_executed = place_exit_order(
+                    exit_executed, exit_filled_amount = place_exit_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -825,11 +868,11 @@ while True:
                             reason="profit_target",
                             status="executed",
                             price=price,
-                            amount=pos["position_amount"],
-                            cost_usd=price * pos["position_amount"],
+                            amount=exit_filled_amount,
+                            cost_usd=price * exit_filled_amount,
                             profit_pct=profit_pct,
                             payload={
-                                "estimated_pnl_usd": (price - entry_price) * pos["position_amount"],
+                                "estimated_pnl_usd": (price - entry_price) * exit_filled_amount,
                                 "target_price": profit_target_price,
                             },
                         )
@@ -847,13 +890,18 @@ while True:
                         amount=pos["position_amount"],
                         profit_pct=profit_pct,
                     )
+                    if exit_filled_amount > 0:
+                        pos["position_amount"] = max(pos["position_amount"] - exit_filled_amount, 0.0)
+                        if pos["position_amount"] <= 0:
+                            reset_position_state(pos, record_exit=True)
+                            continue
 
                 if pos["trailing_profit_target"] > 0 and price >= pos["trailing_profit_target"]:
                     print(
                         f"[{base_currency}] 💰 TRAILING PROFIT TARGET REACHED: "
                         f"{profit_pct * 100:.2f}% profit at {format_price(price)}"
                     )
-                    exit_executed = place_exit_order(
+                    exit_executed, exit_filled_amount = place_exit_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -873,11 +921,11 @@ while True:
                             reason="trailing_profit",
                             status="executed",
                             price=price,
-                            amount=pos["position_amount"],
-                            cost_usd=price * pos["position_amount"],
+                            amount=exit_filled_amount,
+                            cost_usd=price * exit_filled_amount,
                             profit_pct=profit_pct,
                             payload={
-                                "estimated_pnl_usd": (price - entry_price) * pos["position_amount"],
+                                "estimated_pnl_usd": (price - entry_price) * exit_filled_amount,
                                 "trailing_profit_target": pos["trailing_profit_target"],
                             },
                         )
@@ -895,6 +943,11 @@ while True:
                         amount=pos["position_amount"],
                         profit_pct=profit_pct,
                     )
+                    if exit_filled_amount > 0:
+                        pos["position_amount"] = max(pos["position_amount"] - exit_filled_amount, 0.0)
+                        if pos["position_amount"] <= 0:
+                            reset_position_state(pos, record_exit=True)
+                            continue
 
                 potential_stop = price - (atr * dynamic_atr_multiplier)
                 if potential_stop > pos["trailing_stop_price"]:
@@ -927,7 +980,7 @@ while True:
                         f"[{base_currency}] 🚨 STOP LOSS TRIGGERED at {format_price(price)} "
                         f"(Entry: {format_price(entry_price)}, P/L: {profit_pct * 100:.2f}%)"
                     )
-                    exit_executed = place_exit_order(
+                    exit_executed, exit_filled_amount = place_exit_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -948,11 +1001,11 @@ while True:
                             reason="stop_loss",
                             status="executed",
                             price=price,
-                            amount=pos["position_amount"],
-                            cost_usd=price * pos["position_amount"],
+                            amount=exit_filled_amount,
+                            cost_usd=price * exit_filled_amount,
                             profit_pct=profit_pct,
                             payload={
-                                "estimated_pnl_usd": (price - entry_price) * pos["position_amount"],
+                                "estimated_pnl_usd": (price - entry_price) * exit_filled_amount,
                                 "stop_price": pos["trailing_stop_price"],
                             },
                         )
@@ -970,6 +1023,10 @@ while True:
                             amount=pos["position_amount"],
                             profit_pct=profit_pct,
                         )
+                        if exit_filled_amount > 0:
+                            pos["position_amount"] = max(pos["position_amount"] - exit_filled_amount, 0.0)
+                            if pos["position_amount"] <= 0:
+                                reset_position_state(pos, record_exit=True)
 
         except Exception as exc:
             journal.log_event(
