@@ -10,9 +10,14 @@ ROOT = pathlib.Path(__file__).resolve().parent
 class FakeExchange:
     def __init__(self, balance):
         self._balance = balance
+        self.market_buy_orders = []
 
     def fetch_balance(self):
         return self._balance
+
+    def create_market_buy_order(self, symbol, cost):
+        self.market_buy_orders.append((symbol, cost))
+        return {"id": "test-order"}
 
 
 def load_function(module_path, function_name, namespace=None):
@@ -29,6 +34,38 @@ def load_function(module_path, function_name, namespace=None):
 
 
 class OrderSizingTests(unittest.TestCase):
+    def test_multi_symbol_market_entry_places_cost_matching_recorded_amount(self):
+        get_position_size = load_function(
+            "main_multi_symbol.py",
+            "get_position_size",
+            {"Tuple": Tuple},
+        )
+        place_entry_order = load_function("main_multi_symbol.py", "place_entry_order")
+        exchange = FakeExchange({"USD": {"free": 1000.0}})
+        price = 250.0
+
+        amount, cost = get_position_size(
+            exchange,
+            "ETH/USD",
+            current_price=price,
+            symbol_risk_slice=0.20,
+            leverage=5,
+        )
+        executed = place_entry_order(
+            exchange,
+            "ETH/USD",
+            "ETH",
+            amount,
+            cost,
+            use_limit_orders=False,
+            limit_order_offset_pct=0.001,
+            enable_trading=True,
+        )
+
+        self.assertTrue(executed)
+        self.assertEqual(exchange.market_buy_orders, [("ETH/USD", 1000.0)])
+        self.assertAlmostEqual(exchange.market_buy_orders[0][1], amount * price)
+
     def test_multi_symbol_position_amount_matches_market_buy_cost(self):
         get_position_size = load_function(
             "main_multi_symbol.py",
