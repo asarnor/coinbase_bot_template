@@ -255,7 +255,7 @@ def test_trade_execution():
             
             # Execute test buy order
             try:
-                order = exchange.create_market_buy_order(symbol, amount_eth)
+                order = exchange.create_market_buy_order(symbol, position_value)
                 print(f"✅ Order executed successfully!")
                 print(f"   Order ID: {order.get('id', 'N/A')}")
                 print(f"   Status: {order.get('status', 'N/A')}")
@@ -360,7 +360,7 @@ def get_position_size(current_price):
         margin_to_use = free_usd * risk_pct
         position_value = margin_to_use * leverage
         amount_eth = position_value / current_price
-        return amount_eth, margin_to_use
+        return amount_eth, position_value
     except Exception as e:
         print(f"Balance Error: {e}")
         return 0, 0
