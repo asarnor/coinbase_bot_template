@@ -360,7 +360,7 @@ def get_position_size(current_price):
         margin_to_use = free_usd * risk_pct
         position_value = margin_to_use * leverage
         amount_eth = position_value / current_price
-        return amount_eth, margin_to_use
+        return amount_eth, position_value
     except Exception as e:
         print(f"Balance Error: {e}")
         return 0, 0
