@@ -190,6 +190,16 @@ def place_entry_order(
     limit_order_offset_pct: float,
     enable_trading: bool,
 ) -> bool:
+    def cancel_unfilled_limit_order(order_id: str, side: str) -> None:
+        if not order_id:
+            print(f"[{base_currency}] ⚠️  Cannot cancel unfilled {side} limit order without an order id")
+            return
+        try:
+            exchange.cancel_order(order_id, symbol)
+            print(f"[{base_currency}] ✅ Canceled unfilled {side} limit order: {order_id}")
+        except Exception as cancel_exc:
+            print(f"[{base_currency}] ⚠️  Could not cancel unfilled {side} limit order {order_id}: {cancel_exc}")
+
     if use_limit_orders:
         limit_price = exchange.fetch_ticker(symbol)["last"] * (1 - limit_order_offset_pct)
         print(
@@ -200,18 +210,24 @@ def place_entry_order(
             print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
             return True
 
+        order_id = None
         try:
             order = exchange.create_limit_buy_order(symbol, amount, limit_price)
-            print(f"[{base_currency}] ✅ Limit order placed: {order.get('id', 'N/A')}")
+            order_id = order.get("id")
+            print(f"[{base_currency}] ✅ Limit order placed: {order_id or 'N/A'}")
             time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
+            order_status = exchange.fetch_order(order_id, symbol)
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit order filled")
                 return True
-            print(f"[{base_currency}] ⏳ Limit order still open; waiting for the next cycle")
+            print(f"[{base_currency}] ⏳ Limit order still open; canceling to avoid untracked exposure")
+            cancel_unfilled_limit_order(order_id, "entry")
             return False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
+            if order_id:
+                cancel_unfilled_limit_order(order_id, "entry")
+                return False
             try:
                 order = exchange.create_market_buy_order(symbol, cost)
                 print(f"[{base_currency}] ✅ Fallback market order executed: {order.get('id', 'N/A')}")
@@ -245,28 +261,44 @@ def place_exit_order(
     enable_trading: bool,
     force_market: bool = False,
 ) -> bool:
+    def cancel_unfilled_limit_order(order_id: str, side: str) -> None:
+        if not order_id:
+            print(f"[{base_currency}] ⚠️  Cannot cancel unfilled {side} limit order without an order id")
+            return
+        try:
+            exchange.cancel_order(order_id, symbol)
+            print(f"[{base_currency}] ✅ Canceled unfilled {side} limit order: {order_id}")
+        except Exception as cancel_exc:
+            print(f"[{base_currency}] ⚠️  Could not cancel unfilled {side} limit order {order_id}: {cancel_exc}")
+
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
         return True
 
     if use_limit_orders and not force_market:
+        order_id = None
         try:
             last_price = exchange.fetch_ticker(symbol)["last"]
             limit_price = last_price * (1 + limit_order_offset_pct)
             order = exchange.create_limit_sell_order(symbol, amount, limit_price)
+            order_id = order.get("id")
             print(
                 f"[{base_currency}] ✅ {reason} limit order placed: "
-                f"{order.get('id', 'N/A')} at ${limit_price:.2f}"
+                f"{order_id or 'N/A'} at ${limit_price:.2f}"
             )
             time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
+            order_status = exchange.fetch_order(order_id, symbol)
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit exit filled")
                 return True
-            print(f"[{base_currency}] ⏳ Exit limit order still open; keeping position state intact")
+            print(f"[{base_currency}] ⏳ Exit limit order still open; canceling before the next exit attempt")
+            cancel_unfilled_limit_order(order_id, "exit")
             return False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
+            if order_id:
+                cancel_unfilled_limit_order(order_id, "exit")
+                return False
 
     try:
         order = exchange.create_market_sell_order(symbol, amount)
@@ -328,7 +360,7 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         margin_to_use = free_usd * symbol_risk_slice
         position_value = margin_to_use * leverage
         amount = position_value / current_price if current_price > 0 else 0
-        return amount, margin_to_use
+        return amount, position_value
     except Exception as exc:
         print(f"Balance Error for {symbol}: {exc}")
         return 0, 0
