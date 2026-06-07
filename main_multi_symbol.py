@@ -15,6 +15,7 @@ import pandas_ta_classic as ta
 from dotenv import load_dotenv
 
 from portfolio_utils import fetch_portfolio_snapshot
+from trading_math import calculate_spot_position_size
 from trading_journal import TradingJournal
 
 
@@ -325,10 +326,7 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         if free_usd <= 0:
             free_usd = balance.get("USDC", {}).get("free", 0)
 
-        margin_to_use = free_usd * symbol_risk_slice
-        position_value = margin_to_use * leverage
-        amount = position_value / current_price if current_price > 0 else 0
-        return amount, margin_to_use
+        return calculate_spot_position_size(free_usd, current_price, symbol_risk_slice)
     except Exception as exc:
         print(f"Balance Error for {symbol}: {exc}")
         return 0, 0
@@ -354,7 +352,7 @@ symbols = parse_symbol_list(
     os.getenv("TRADING_SYMBOLS", "ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD")
 )
 timeframe = os.getenv("TRADING_TIMEFRAME", "5m")
-leverage = int(os.getenv("TRADING_LEVERAGE", "5"))
+leverage = int(os.getenv("TRADING_LEVERAGE", "1"))
 risk_pct = float(os.getenv("TRADING_RISK_PCT", "0.20"))
 check_interval = int(os.getenv("TRADING_CHECK_INTERVAL", "60"))
 cooldown_minutes = int(os.getenv("TRADING_COOLDOWN_MINUTES", "5"))
