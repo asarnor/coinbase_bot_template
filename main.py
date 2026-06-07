@@ -6,6 +6,7 @@ import sys
 import argparse
 import os
 from dotenv import load_dotenv
+from trading_math import calculate_spot_position_size
 
 # Load base .env file first (for shared config)
 load_dotenv()
@@ -14,7 +15,7 @@ load_dotenv()
 # Read from environment variables, fallback to defaults
 symbol = os.getenv('TRADING_SYMBOL', 'ETH/USD')       # Coinbase uses USD, not USDT
 timeframe = os.getenv('TRADING_TIMEFRAME', '5m')       # Fast timeframe
-leverage = int(os.getenv('TRADING_LEVERAGE', '5'))     # 5x Leverage (for futures/advanced trade)
+leverage = int(os.getenv('TRADING_LEVERAGE', '1'))     # Spot buys are sized without leverage
 risk_pct = float(os.getenv('TRADING_RISK_PCT', '0.20'))  # Invest 20% of account balance
 atr_multiplier = float(os.getenv('TRADING_ATR_MULTIPLIER', '1.5'))  # 1.5x Volatility Safety Net
 check_interval = int(os.getenv('TRADING_CHECK_INTERVAL', '60'))  # Check market every N seconds (default: 60)
@@ -241,13 +242,10 @@ def test_trade_execution():
             print("⚠️  No USD/USDC balance available for testing")
             return False
         
-        margin_to_use = free_usd * risk_pct
-        position_value = margin_to_use * leverage
-        amount_eth = position_value / current_price
+        amount_eth, margin_to_use = calculate_spot_position_size(free_usd, current_price, risk_pct)
         
         print(f"   Calculated position size: {amount_eth:.6f} {symbol.split('/')[0]}")
-        print(f"   Margin to use: ${margin_to_use:.2f}")
-        print(f"   Position value (with {leverage}x leverage): ${position_value:.2f}")
+        print(f"   Quote cost to use: ${margin_to_use:.2f}")
         
         if enable_trading:
             print(f"\n⚠️  EXECUTING TEST TRADE (Sandbox: {use_sandbox})...")
@@ -357,10 +355,7 @@ def get_position_size(current_price):
         balance = exchange.fetch_balance()
         # Coinbase uses USD instead of USDT
         free_usd = balance['USD']['free'] if 'USD' in balance else balance.get('USDC', {}).get('free', 0)
-        margin_to_use = free_usd * risk_pct
-        position_value = margin_to_use * leverage
-        amount_eth = position_value / current_price
-        return amount_eth, margin_to_use
+        return calculate_spot_position_size(free_usd, current_price, risk_pct)
     except Exception as e:
         print(f"Balance Error: {e}")
         return 0, 0

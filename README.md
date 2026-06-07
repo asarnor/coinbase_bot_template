@@ -151,7 +151,7 @@ Runtime loading behavior:
 | `TRADING_REGIME_SYMBOLS` | Higher-timeframe benchmark symbols | `BTC/USD,ETH/USD` |
 | `TRADING_REGIME_TIMEFRAME` | Timeframe used for regime detection | `1h` |
 | `TRADING_TIMEFRAME` | Trading timeframe for signal generation | `5m` |
-| `TRADING_LEVERAGE` | Requested leverage setting | `5` |
+| `TRADING_LEVERAGE` | Requested leverage setting; spot order sizing remains unleveraged | `1` |
 | `TRADING_RISK_PCT` | Total portfolio risk allocated across all tracked symbols | `0.20` |
 | `TRADING_CHECK_INTERVAL` | Seconds between cycles | `60` |
 | `TRADING_COOLDOWN_MINUTES` | Cooldown after exits | `5` |

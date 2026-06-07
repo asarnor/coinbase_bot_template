@@ -17,7 +17,7 @@ services:
       - key: TRADING_TIMEFRAME
         value: 5m
       - key: TRADING_LEVERAGE
-        value: 5
+        value: 1
       - key: TRADING_RISK_PCT
         value: 0.20
       - key: TRADING_ATR_MULTIPLIER
