@@ -357,10 +357,13 @@ def get_position_size(current_price):
         balance = exchange.fetch_balance()
         # Coinbase uses USD instead of USDT
         free_usd = balance['USD']['free'] if 'USD' in balance else balance.get('USDC', {}).get('free', 0)
+        if current_price <= 0:
+            return 0, 0
+
         margin_to_use = free_usd * risk_pct
         position_value = margin_to_use * leverage
         amount_eth = position_value / current_price
-        return amount_eth, margin_to_use
+        return amount_eth, position_value
     except Exception as e:
         print(f"Balance Error: {e}")
         return 0, 0
