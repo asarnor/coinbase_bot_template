@@ -203,13 +203,6 @@ def place_entry_order(
         try:
             order = exchange.create_limit_buy_order(symbol, amount, limit_price)
             print(f"[{base_currency}] ✅ Limit order placed: {order.get('id', 'N/A')}")
-            time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
-            if order_status.get("status") == "closed":
-                print(f"[{base_currency}] ✅ Limit order filled")
-                return True
-            print(f"[{base_currency}] ⏳ Limit order still open; waiting for the next cycle")
-            return False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
             try:
@@ -219,6 +212,22 @@ def place_entry_order(
             except Exception as fallback_exc:
                 print(f"[{base_currency}] ❌ Market entry also failed: {fallback_exc}")
                 return False
+
+        order_id = order.get("id")
+        time.sleep(5)
+        try:
+            order_status = exchange.fetch_order(order_id, symbol)
+        except Exception as exc:
+            print(f"[{base_currency}] ❌ Could not confirm limit entry status: {exc}")
+            cancel_limit_order(exchange, symbol, base_currency, order, "entry")
+            return False
+
+        if order_status.get("status") == "closed":
+            print(f"[{base_currency}] ✅ Limit order filled")
+            return True
+        print(f"[{base_currency}] ⏳ Limit order still open; canceling before retry")
+        cancel_limit_order(exchange, symbol, base_currency, order, "entry")
+        return False
 
     print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
     if not enable_trading:
@@ -231,6 +240,21 @@ def place_entry_order(
         return True
     except Exception as exc:
         print(f"[{base_currency}] ❌ Order failed: {exc}")
+        return False
+
+
+def cancel_limit_order(exchange, symbol: str, base_currency: str, order: Dict, action: str) -> bool:
+    order_id = order.get("id") if order else None
+    if not order_id:
+        print(f"[{base_currency}] ⚠️  Cannot cancel {action} limit order without an order id")
+        return False
+
+    try:
+        exchange.cancel_order(order_id, symbol)
+        print(f"[{base_currency}] ✅ Canceled unfilled {action} limit order: {order_id}")
+        return True
+    except Exception as exc:
+        print(f"[{base_currency}] ❌ Could not cancel {action} limit order {order_id}: {exc}")
         return False
 
 
@@ -258,15 +282,24 @@ def place_exit_order(
                 f"[{base_currency}] ✅ {reason} limit order placed: "
                 f"{order.get('id', 'N/A')} at ${limit_price:.2f}"
             )
+        except Exception as exc:
+            print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
+        else:
+            order_id = order.get("id")
             time.sleep(5)
-            order_status = exchange.fetch_order(order.get("id"), symbol)
+            try:
+                order_status = exchange.fetch_order(order_id, symbol)
+            except Exception as exc:
+                print(f"[{base_currency}] ❌ Could not confirm limit exit status: {exc}")
+                cancel_limit_order(exchange, symbol, base_currency, order, "exit")
+                return False
+
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit exit filled")
                 return True
-            print(f"[{base_currency}] ⏳ Exit limit order still open; keeping position state intact")
+            print(f"[{base_currency}] ⏳ Exit limit order still open; canceling before retry")
+            cancel_limit_order(exchange, symbol, base_currency, order, "exit")
             return False
-        except Exception as exc:
-            print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
 
     try:
         order = exchange.create_market_sell_order(symbol, amount)
@@ -328,7 +361,7 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         margin_to_use = free_usd * symbol_risk_slice
         position_value = margin_to_use * leverage
         amount = position_value / current_price if current_price > 0 else 0
-        return amount, margin_to_use
+        return amount, position_value
     except Exception as exc:
         print(f"Balance Error for {symbol}: {exc}")
         return 0, 0
@@ -798,6 +831,7 @@ while True:
                         amount=pos["position_amount"],
                         profit_pct=profit_pct,
                     )
+                    continue
 
                 profit_target_price = entry_price * (1 + dynamic_profit_target)
                 if price >= profit_target_price:
@@ -847,6 +881,7 @@ while True:
                         amount=pos["position_amount"],
                         profit_pct=profit_pct,
                     )
+                    continue
 
                 if pos["trailing_profit_target"] > 0 and price >= pos["trailing_profit_target"]:
                     print(
@@ -895,6 +930,7 @@ while True:
                         amount=pos["position_amount"],
                         profit_pct=profit_pct,
                     )
+                    continue
 
                 potential_stop = price - (atr * dynamic_atr_multiplier)
                 if potential_stop > pos["trailing_stop_price"]:
