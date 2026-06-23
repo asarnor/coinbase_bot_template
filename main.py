@@ -68,6 +68,20 @@ if api_secret and '\\n' in api_secret:
     if not args.test:
         print(f"🔍 Debug: Converted \\n to actual newlines")
 
+
+def configure_effective_leverage(exchange, symbols, requested_leverage):
+    try:
+        for leverage_symbol in symbols:
+            exchange.set_leverage(requested_leverage, leverage_symbol)
+        print(f"⚡ Leverage set to {requested_leverage}x.")
+        return requested_leverage
+    except Exception as e:
+        print(f"⚠️  Could not set leverage automatically: {e}")
+        if requested_leverage != 1:
+            print("⚠️  Falling back to 1x spot sizing so recorded exits match actual buys.")
+        return 1
+
+
 # Validate API keys (passphrase is optional for Advanced Trade API)
 has_placeholder_keys = api_key == 'YOUR_API_KEY' or api_secret == 'YOUR_SECRET_KEY'
 
@@ -148,14 +162,7 @@ except Exception as e:
         print("\nNote: If you're using legacy Coinbase Pro, you may also need a passphrase.")
     sys.exit()
 
-# Try setting leverage (Coinbase Advanced Trade supports futures)
-try:
-    # Coinbase Advanced Trade futures leverage setting
-    exchange.set_leverage(leverage, symbol)
-    print(f"⚡ Leverage set to {leverage}x.")
-except Exception as e:
-    print(f"⚠️  Could not set leverage automatically: {e}")
-    print("⚠️  Ensure leverage is set manually in Coinbase Advanced Trade, or use spot trading.")
+effective_leverage = configure_effective_leverage(exchange, [symbol], leverage)
 
 # Define core functions (needed for testing)
 def fetch_data():
@@ -242,12 +249,12 @@ def test_trade_execution():
             return False
         
         margin_to_use = free_usd * risk_pct
-        position_value = margin_to_use * leverage
+        position_value = margin_to_use * effective_leverage
         amount_eth = position_value / current_price
         
         print(f"   Calculated position size: {amount_eth:.6f} {symbol.split('/')[0]}")
         print(f"   Margin to use: ${margin_to_use:.2f}")
-        print(f"   Position value (with {leverage}x leverage): ${position_value:.2f}")
+        print(f"   Position value (with {effective_leverage}x leverage): ${position_value:.2f}")
         
         if enable_trading:
             print(f"\n⚠️  EXECUTING TEST TRADE (Sandbox: {use_sandbox})...")
@@ -255,7 +262,7 @@ def test_trade_execution():
             
             # Execute test buy order
             try:
-                order = exchange.create_market_buy_order(symbol, amount_eth)
+                order = exchange.create_market_buy_order(symbol, margin_to_use)
                 print(f"✅ Order executed successfully!")
                 print(f"   Order ID: {order.get('id', 'N/A')}")
                 print(f"   Status: {order.get('status', 'N/A')}")
@@ -358,7 +365,7 @@ def get_position_size(current_price):
         # Coinbase uses USD instead of USDT
         free_usd = balance['USD']['free'] if 'USD' in balance else balance.get('USDC', {}).get('free', 0)
         margin_to_use = free_usd * risk_pct
-        position_value = margin_to_use * leverage
+        position_value = margin_to_use * effective_leverage
         amount_eth = position_value / current_price
         return amount_eth, margin_to_use
     except Exception as e:
@@ -420,17 +427,21 @@ while True:
             if price <= trailing_stop_price:
                 print(f"🚨 STOP LOSS TRIGGERED at ${price:.2f}")
                 
+                exit_executed = False
                 if enable_trading:
                     try:
                         order = exchange.create_market_sell_order(symbol, position_amount)
                         print(f"✅ Sell order executed: {order.get('id', 'N/A')}")
+                        exit_executed = True
                     except Exception as e:
                         print(f"❌ Sell order failed: {e}")
                 else:
                     print(f"   (Simulated - use --execute to enable real trading)")
-                
-                in_position = False
-                trailing_stop_price = 0.0
-                position_amount = 0.0
+                    exit_executed = True
+
+                if exit_executed:
+                    in_position = False
+                    trailing_stop_price = 0.0
+                    position_amount = 0.0
 
     time.sleep(check_interval)  # Check every N seconds (configurable via TRADING_CHECK_INTERVAL)

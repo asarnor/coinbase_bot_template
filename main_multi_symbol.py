@@ -334,6 +334,25 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         return 0, 0
 
 
+def configure_effective_leverage(exchange, symbols: List[str], requested_leverage: int, journal) -> int:
+    try:
+        for symbol in symbols:
+            exchange.set_leverage(requested_leverage, symbol)
+        print(f"⚡ Leverage set to {requested_leverage}x for all symbols.")
+        return requested_leverage
+    except Exception as exc:
+        journal.log_event(
+            "warning",
+            reason="set_leverage_not_supported",
+            status="warning",
+            payload={"message": str(exc), "requested_leverage": requested_leverage},
+        )
+        print(f"⚠️  Could not set leverage automatically: {exc}")
+        if requested_leverage != 1:
+            print("⚠️  Falling back to 1x spot sizing so recorded exits match actual buys.")
+        return 1
+
+
 load_dotenv()
 
 parser = argparse.ArgumentParser(description="Multi-Symbol Coinbase Trading Bot")
@@ -438,18 +457,7 @@ except Exception as exc:
     print(f"❌ Connection Error: {exc}")
     sys.exit()
 
-try:
-    for symbol in symbols:
-        exchange.set_leverage(leverage, symbol)
-    print(f"⚡ Leverage set to {leverage}x for all symbols.")
-except Exception as exc:
-    journal.log_event(
-        "warning",
-        reason="set_leverage_not_supported",
-        status="warning",
-        payload={"message": str(exc)},
-    )
-    print(f"⚠️  Could not set leverage automatically: {exc}")
+effective_leverage = configure_effective_leverage(exchange, symbols, leverage, journal)
 
 positions = {}
 for symbol in symbols:
@@ -499,7 +507,8 @@ journal.log_event(
         "timeframe": timeframe,
         "regime_symbols": benchmark_symbols,
         "risk_pct": risk_pct,
-        "leverage": leverage,
+        "leverage": effective_leverage,
+        "requested_leverage": leverage,
         "enable_trading": enable_trading,
         "journal_backend": journal.describe_backend(),
     },
@@ -639,7 +648,7 @@ while True:
 
                 if price_above_ema and rsi_strong and trend_strong_enough and ema_trending_up and volume_adequate:
                     risk_slice = risk_pct * symbol_weights[symbol] / total_risk_weight
-                    amount, cost = get_position_size(exchange, symbol, price, risk_slice, leverage)
+                    amount, cost = get_position_size(exchange, symbol, price, risk_slice, effective_leverage)
 
                     if cost < min_order_size:
                         journal.log_event(
