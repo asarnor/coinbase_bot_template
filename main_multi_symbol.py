@@ -334,6 +334,29 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         return 0, 0
 
 
+def configure_effective_leverage(exchange, symbols: List[str], requested_leverage: int, journal=None) -> int:
+    if requested_leverage <= 1:
+        print("⚡ Leverage disabled; using spot sizing.")
+        return 1
+
+    try:
+        for symbol in symbols:
+            exchange.set_leverage(requested_leverage, symbol)
+        print(f"⚡ Leverage set to {requested_leverage}x for all symbols.")
+        return requested_leverage
+    except Exception as exc:
+        if journal is not None:
+            journal.log_event(
+                "warning",
+                reason="set_leverage_not_supported",
+                status="warning",
+                payload={"message": str(exc), "requested_leverage": requested_leverage, "effective_leverage": 1},
+            )
+        print(f"⚠️  Could not set leverage automatically: {exc}")
+        print("⚡ Falling back to 1x spot sizing so recorded positions match actual fills.")
+        return 1
+
+
 load_dotenv()
 
 parser = argparse.ArgumentParser(description="Multi-Symbol Coinbase Trading Bot")
@@ -438,18 +461,7 @@ except Exception as exc:
     print(f"❌ Connection Error: {exc}")
     sys.exit()
 
-try:
-    for symbol in symbols:
-        exchange.set_leverage(leverage, symbol)
-    print(f"⚡ Leverage set to {leverage}x for all symbols.")
-except Exception as exc:
-    journal.log_event(
-        "warning",
-        reason="set_leverage_not_supported",
-        status="warning",
-        payload={"message": str(exc)},
-    )
-    print(f"⚠️  Could not set leverage automatically: {exc}")
+leverage = configure_effective_leverage(exchange, symbols, leverage, journal)
 
 positions = {}
 for symbol in symbols:
