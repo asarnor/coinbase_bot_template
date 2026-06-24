@@ -2,7 +2,7 @@ import ast
 import math
 import unittest
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 
 def load_functions(*names):
@@ -13,7 +13,7 @@ def load_functions(*names):
         for node in module.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
-    namespace = {"List": List}
+    namespace = {"List": List, "Tuple": Tuple}
     exec(compile(ast.Module(body=selected, type_ignores=[]), "main_multi_symbol.py", "exec"), namespace)
     return [namespace[name] for name in names]
 
