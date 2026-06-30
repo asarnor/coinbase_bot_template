@@ -140,6 +140,18 @@ class OrderExecutionSafetyTests(unittest.TestCase):
         self.assertEqual(exchange.canceled, [("order-1", "ETH/USD")])
         self.assertEqual(exchange.market_sells, [])
 
+    def test_uncertain_limit_exit_is_canceled_without_market_fallback(self):
+        exchange = FakeExchange()
+        exchange.fetch_order_error = RuntimeError("timeout")
+
+        result = FUNCTIONS["place_exit_order"](
+            exchange, "ETH/USD", "ETH", 1.0, "Profit-taking", True, 0.001, True
+        )
+
+        self.assertEqual(result, (False, 0.0))
+        self.assertEqual(exchange.canceled, [("order-1", "ETH/USD")])
+        self.assertEqual(exchange.market_sells, [])
+
     def test_partial_exit_fill_reduces_local_position(self):
         position = {
             "in_position": True,
