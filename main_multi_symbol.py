@@ -529,10 +529,25 @@ if args.test:
     print("=" * 60)
 
 try:
+    # Coinbase Advanced Trade is exposed as `ccxt.coinbase` in current ccxt versions.
+    # Older aliases (e.g. `coinbaseadvanced`) may not exist, so resolve defensively
+    # with getattr instead of attribute access that would raise AttributeError.
     if use_sandbox:
-        ExchangeClass = ccxt.coinbaseexchange or ccxt.coinbaseadvanced
+        preferred_exchange_ids = ["coinbaseexchange", "coinbase", "coinbaseadvanced"]
     else:
-        ExchangeClass = ccxt.coinbaseadvanced or ccxt.coinbaseexchange
+        preferred_exchange_ids = ["coinbase", "coinbaseadvanced", "coinbaseexchange"]
+
+    ExchangeClass = None
+    exchange_id = None
+    for candidate_id in preferred_exchange_ids:
+        ExchangeClass = getattr(ccxt, candidate_id, None)
+        if ExchangeClass is not None:
+            exchange_id = candidate_id
+            break
+    if ExchangeClass is None:
+        raise AttributeError(
+            "No Coinbase exchange class found in ccxt. Update ccxt: pip install -U ccxt"
+        )
 
     exchange_config = {
         "apiKey": api_key,
@@ -550,7 +565,7 @@ try:
         exchange_config["password"] = api_passphrase
 
     exchange = ExchangeClass(exchange_config)
-    print(f"🔌 Connecting to {'SANDBOX' if use_sandbox else 'PRODUCTION'}...")
+    print(f"🔌 Connecting to {'SANDBOX' if use_sandbox else 'PRODUCTION'} via ccxt.{exchange_id}...")
     exchange.load_markets()
     print("✅ Connected to Coinbase Advanced Trade successfully.")
     print(f"📊 Trading symbols: {', '.join(symbols)}")

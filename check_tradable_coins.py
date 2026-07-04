@@ -24,7 +24,7 @@ print("=" * 70)
 print()
 
 try:
-    exchange = ccxt.coinbaseadvanced({
+    exchange = (getattr(ccxt, "coinbase", None) or ccxt.coinbaseexchange)({
         'apiKey': api_key,
         'secret': api_secret,
         'enableRateLimit': True,

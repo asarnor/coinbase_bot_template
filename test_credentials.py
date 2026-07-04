@@ -81,7 +81,7 @@ try:
     if '\\n' in processed_secret:
         processed_secret = processed_secret.replace('\\n', '\n')
     
-    exchange = ccxt.coinbaseadvanced({
+    exchange = (getattr(ccxt, "coinbase", None) or ccxt.coinbaseexchange)({
         'apiKey': api_key,
         'secret': processed_secret,
         'enableRateLimit': True,

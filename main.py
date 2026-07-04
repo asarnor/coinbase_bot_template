@@ -82,13 +82,19 @@ if args.test:
 
 # API SETUP
 try:
-    # Get the exchange class - Use coinbaseexchange for sandbox support, coinbaseadvanced for production
-    # Fallback chain ensures we get a valid exchange class even if one is missing
-    # Using OR operators similar to JavaScript implementation
+    # Coinbase Advanced Trade is `ccxt.coinbase` in current ccxt; sandbox uses
+    # coinbaseexchange. Resolve defensively so a missing alias does not raise.
     if use_sandbox:
-        ExchangeClass = ccxt.coinbaseexchange or ccxt.coinbaseadvanced
+        _preferred_ids = ["coinbaseexchange", "coinbase", "coinbaseadvanced"]
     else:
-        ExchangeClass = ccxt.coinbaseadvanced or ccxt.coinbaseexchange
+        _preferred_ids = ["coinbase", "coinbaseadvanced", "coinbaseexchange"]
+    ExchangeClass = None
+    for _candidate_id in _preferred_ids:
+        ExchangeClass = getattr(ccxt, _candidate_id, None)
+        if ExchangeClass is not None:
+            break
+    if ExchangeClass is None:
+        raise AttributeError("No Coinbase exchange class found in ccxt. Run: pip install -U ccxt")
     
     # Build exchange config
     # Note: Sandbox (coinbaseexchange) requires password field even if empty

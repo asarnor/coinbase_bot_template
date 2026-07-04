@@ -34,7 +34,7 @@ print()
 try:
     # Connect to Coinbase Advanced Trade API
     print("🔌 Connecting to Coinbase Advanced Trade...")
-    exchange = ccxt.coinbaseadvanced({
+    exchange = (getattr(ccxt, "coinbase", None) or ccxt.coinbaseexchange)({
         'apiKey': api_key,
         'secret': api_secret,
         'enableRateLimit': True,
