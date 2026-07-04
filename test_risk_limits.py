@@ -4,16 +4,19 @@
 Run with:  python -m unittest test_risk_limits    (no extra dependencies required)
 """
 import unittest
+import json
 from datetime import datetime, timezone
 
 from risk_limits import (
     compute_position_size,
     current_day_key,
+    daily_state_day_bounds,
     evaluate_entry_limits,
     extract_fill,
     new_daily_state,
     record_realized_pnl,
     record_trade,
+    restore_daily_state_from_events,
     reset_daily_state,
     setup_is_stronger,
     symbol_loss_limit_hit,
@@ -91,6 +94,11 @@ class DailyStateTests(unittest.TestCase):
         moment = datetime(2026, 7, 3, 23, 59, tzinfo=timezone.utc)
         self.assertEqual(current_day_key(moment), "2026-07-03")
 
+    def test_daily_state_day_bounds_are_utc_iso_window(self):
+        start, end = daily_state_day_bounds("2026-07-03")
+        self.assertEqual(start, "2026-07-03T00:00:00+00:00")
+        self.assertEqual(end, "2026-07-04T00:00:00+00:00")
+
     def test_record_trade_tracks_per_coin(self):
         state = new_daily_state("2026-07-03", start_equity_usd=1000)
         record_trade(state, "BTC/USD")
@@ -119,6 +127,70 @@ class DailyStateTests(unittest.TestCase):
         self.assertEqual(state["symbol_realized_pnl_usd"], {})
         self.assertEqual(state["symbol_halted"], {})
         self.assertAlmostEqual(state["start_equity_usd"], 1200)
+
+    def test_restore_daily_state_from_journal_events(self):
+        events = [
+            {
+                "event_type": "entry_executed",
+                "status": "executed",
+                "symbol": "BTC/USD",
+                "payload_json": json.dumps(STRONG),
+            },
+            {
+                "event_type": "entry_executed",
+                "status": "executed",
+                "symbol": "ETH/USD",
+                "payload_json": json.dumps(WEAKER),
+            },
+            {
+                "event_type": "exit_executed",
+                "status": "executed",
+                "symbol": "BTC/USD",
+                "payload_json": json.dumps({"estimated_pnl_usd": -75.5}),
+            },
+            {
+                "event_type": "daily_loss_limit_triggered",
+                "status": "halted",
+                "symbol": "BTC/USD",
+                "payload_json": json.dumps({"start_equity_usd": 1000}),
+            },
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "status": "pending_or_failed",
+                "symbol": "LINK/USD",
+                "payload_json": "{}",
+            },
+        ]
+
+        state = restore_daily_state_from_events("2026-07-03", events, start_equity_usd=1000)
+
+        self.assertEqual(state["trades"], 2)
+        self.assertEqual(symbol_trade_count(state, "BTC/USD"), 1)
+        self.assertEqual(symbol_trade_count(state, "ETH/USD"), 1)
+        self.assertEqual(symbol_trade_count(state, "LINK/USD"), 0)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "BTC/USD"), -75.5)
+        self.assertTrue(state["symbol_halted"]["BTC/USD"])
+        self.assertEqual(state["symbol_last_entry_signal"]["BTC/USD"], STRONG)
+
+    def test_restore_daily_state_ignores_bad_exit_pnl_payloads(self):
+        events = [
+            {
+                "event_type": "exit_executed",
+                "status": "executed",
+                "symbol": "BTC/USD",
+                "payload_json": "{not-json",
+            },
+            {
+                "event_type": "exit_executed",
+                "status": "executed",
+                "symbol": "ETH/USD",
+                "payload_json": json.dumps({"estimated_pnl_usd": "not-a-number"}),
+            },
+        ]
+
+        state = restore_daily_state_from_events("2026-07-03", events, start_equity_usd=1000)
+
+        self.assertAlmostEqual(state["realized_pnl_usd"], 0.0)
 
 
 class SymbolLossLimitTests(unittest.TestCase):
@@ -156,6 +228,16 @@ class EvaluateEntryLimitsTests(unittest.TestCase):
         state = self._state()
         reasons = evaluate_entry_limits(state, "BTC/USD", 0, 3, 0, 6, 0.05)
         self.assertEqual(reasons, [])
+
+    def test_blocks_when_loss_limit_enabled_without_equity_baseline(self):
+        state = new_daily_state("2026-07-03", start_equity_usd=0)
+        reasons = evaluate_entry_limits(state, "BTC/USD", 0, 3, 0, 6, 0.05)
+        self.assertIn("daily_loss_equity_unavailable", reasons)
+
+    def test_allows_missing_equity_when_loss_limit_disabled(self):
+        state = new_daily_state("2026-07-03", start_equity_usd=0)
+        reasons = evaluate_entry_limits(state, "BTC/USD", 0, 3, 0, 6, 0)
+        self.assertNotIn("daily_loss_equity_unavailable", reasons)
 
     def test_blocks_after_six_trades_per_coin(self):
         state = self._state()

@@ -3,7 +3,7 @@ services:
     name: coinbase-trading-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py --execute
+    startCommand: python app_entrypoint.py
     envVars:
       - key: COINBASE_API_KEY
         sync: false
@@ -24,4 +24,6 @@ services:
         value: 1.5
       - key: TRADING_CHECK_INTERVAL
         value: 60
+      - key: BOT_EXECUTE
+        value: "false"
 
