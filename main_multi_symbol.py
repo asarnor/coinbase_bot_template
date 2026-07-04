@@ -15,6 +15,17 @@ import pandas_ta_classic as ta
 from dotenv import load_dotenv
 
 from portfolio_utils import fetch_portfolio_snapshot
+from risk_limits import (
+    compute_position_size,
+    current_day_key,
+    evaluate_entry_limits,
+    extract_fill,
+    new_daily_state,
+    record_realized_pnl,
+    record_trade,
+    reset_daily_state,
+    symbol_loss_limit_hit,
+)
 from trading_journal import TradingJournal
 
 
@@ -66,7 +77,9 @@ def analyze_market(df: pd.DataFrame) -> pd.Series:
     working["ema_slope"] = working["ema_20"].diff(5)
     working["volume_ma"] = working["volume"].rolling(20).mean()
     working["volume_ratio"] = working["volume"] / working["volume_ma"]
-    return working.iloc[-1]
+    # Use the last CLOSED candle (-2) rather than the still-forming candle (-1)
+    # so signals do not repaint / flip within the current bar.
+    return working.iloc[-2] if len(working) >= 2 else working.iloc[-1]
 
 
 def analyze_regime(df: pd.DataFrame) -> pd.Series:
@@ -74,7 +87,7 @@ def analyze_regime(df: pd.DataFrame) -> pd.Series:
     working["ema_50"] = ta.ema(working["close"], length=50)
     working["rsi"] = ta.rsi(working["close"], length=14)
     working["ema_slope"] = working["ema_50"].diff(5)
-    return working.iloc[-1]
+    return working.iloc[-2] if len(working) >= 2 else working.iloc[-1]
 
 
 def env_float(name: str, default: str, fallback_name: str = None) -> float:
@@ -189,7 +202,7 @@ def place_entry_order(
     use_limit_orders: bool,
     limit_order_offset_pct: float,
     enable_trading: bool,
-) -> bool:
+) -> Tuple[bool, float, float]:
     if use_limit_orders:
         limit_price = exchange.fetch_ticker(symbol)["last"] * (1 - limit_order_offset_pct)
         print(
@@ -198,7 +211,7 @@ def place_entry_order(
         )
         if not enable_trading:
             print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-            return True
+            return True, amount, limit_price
 
         try:
             order = exchange.create_limit_buy_order(symbol, amount, limit_price)
@@ -207,31 +220,34 @@ def place_entry_order(
             order_status = exchange.fetch_order(order.get("id"), symbol)
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit order filled")
-                return True
+                filled, average = extract_fill(order_status, amount, limit_price)
+                return True, filled, average
             print(f"[{base_currency}] ⏳ Limit order still open; waiting for the next cycle")
-            return False
+            return False, 0.0, 0.0
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
             try:
                 order = exchange.create_market_buy_order(symbol, cost)
                 print(f"[{base_currency}] ✅ Fallback market order executed: {order.get('id', 'N/A')}")
-                return True
+                filled, average = extract_fill(order, amount, limit_price)
+                return True, filled, average
             except Exception as fallback_exc:
                 print(f"[{base_currency}] ❌ Market entry also failed: {fallback_exc}")
-                return False
+                return False, 0.0, 0.0
 
     print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True
+        return True, amount, 0.0
 
     try:
         order = exchange.create_market_buy_order(symbol, cost)
         print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
-        return True
+        filled, average = extract_fill(order, amount, 0.0)
+        return True, filled, average
     except Exception as exc:
         print(f"[{base_currency}] ❌ Order failed: {exc}")
-        return False
+        return False, 0.0, 0.0
 
 
 def place_exit_order(
@@ -248,6 +264,20 @@ def place_exit_order(
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
         return True
+
+    # Never try to sell more than we actually hold. Fees/slippage mean the tracked
+    # amount can slightly exceed the free base balance, which would bounce the order.
+    try:
+        base_balance = exchange.fetch_balance().get(base_currency, {}).get("free", amount)
+        if base_balance and base_balance > 0:
+            amount = min(amount, float(base_balance))
+        amount = float(exchange.amount_to_precision(symbol, amount))
+    except Exception as exc:
+        print(f"[{base_currency}] ⚠️  Could not verify balance before sell: {exc}")
+
+    if amount <= 0:
+        print(f"[{base_currency}] ⚠️  No sellable balance for {reason}; skipping order.")
+        return False
 
     if use_limit_orders and not force_market:
         try:
@@ -321,17 +351,107 @@ def get_regime_state(exchange, benchmark_symbols: List[str], regime_timeframe: s
 def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_slice: float, leverage: int) -> Tuple[float, float]:
     try:
         balance = exchange.fetch_balance()
-        free_usd = balance.get("USD", {}).get("free", 0)
+        free_usd = balance.get("USD", {}).get("free", 0) or 0
         if free_usd <= 0:
-            free_usd = balance.get("USDC", {}).get("free", 0)
-
-        margin_to_use = free_usd * symbol_risk_slice
-        position_value = margin_to_use * leverage
-        amount = position_value / current_price if current_price > 0 else 0
-        return amount, margin_to_use
+            free_usd = balance.get("USDC", {}).get("free", 0) or 0
+        return compute_position_size(free_usd, current_price, symbol_risk_slice, leverage)
     except Exception as exc:
         print(f"Balance Error for {symbol}: {exc}")
         return 0, 0
+
+
+def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
+    today = current_day_key()
+    if today == state["day"]:
+        return
+
+    journal.log_event(
+        "daily_reset",
+        status="reset",
+        payload={
+            "previous_day": state["day"],
+            "trades": state["trades"],
+            "realized_pnl_usd": state["realized_pnl_usd"],
+            "symbol_trades": state["symbol_trades"],
+            "symbol_realized_pnl_usd": state["symbol_realized_pnl_usd"],
+            "halted_symbols": [s for s, v in state["symbol_halted"].items() if v],
+        },
+    )
+    start_equity = state.get("start_equity_usd", 0.0)
+    try:
+        snap = fetch_portfolio_snapshot(exchange)
+        start_equity = snap["total_estimated_usd"]
+    except Exception:
+        pass
+    reset_daily_state(state, today, start_equity)
+
+
+def reconcile_open_positions(
+    exchange,
+    symbols: List[str],
+    positions: Dict,
+    symbol_profiles: Dict,
+    profile_settings: Dict,
+    timeframe: str,
+    min_value_usd: float,
+    journal,
+) -> None:
+    """Rebuild in-memory position state from existing exchange balances on startup.
+
+    Without this, a restart forgets open positions, so their stops go unmanaged and
+    the bot may re-buy coins already held. Entry price is unknown after a restart, so
+    the current price is used as a best-effort proxy for stop/target placement.
+    """
+    try:
+        balance = exchange.fetch_balance()
+    except Exception as exc:
+        print(f"⚠️  Could not fetch balance for reconciliation: {exc}")
+        return
+
+    for symbol in symbols:
+        base_currency = symbol.split("/")[0]
+        info = balance.get(base_currency, {})
+        if not isinstance(info, dict):
+            continue
+        held_amount = info.get("total", 0) or info.get("free", 0) or 0
+        if held_amount <= 0:
+            continue
+
+        df = fetch_data(exchange, symbol, timeframe)
+        if df.empty or len(df) < 30:
+            continue
+
+        row = analyze_market(df)
+        price = row["close"]
+        atr = row["atr"]
+        usd_value = held_amount * price
+        if usd_value < max(min_value_usd, 1.0):
+            continue
+
+        profile_name = symbol_profiles[symbol]
+        profile = profile_settings[profile_name]
+        pos = positions[symbol]
+        pos["in_position"] = True
+        pos["position_amount"] = held_amount
+        pos["entry_price"] = price
+        pos["peak_price"] = price
+        pos["trailing_stop_price"] = price - (atr * profile["atr_multiplier"])
+        pos["trailing_profit_target"] = price * (1 + profile["profit_target_pct"])
+        pos["breakeven_set"] = False
+        print(
+            f"[{base_currency}] ♻️  Reconciled existing position: {held_amount:.6f} "
+            f"@ ~{format_price(price)} (${usd_value:.2f})"
+        )
+        journal.log_event(
+            "position_reconciled",
+            symbol=symbol,
+            profile=profile_name,
+            status="reconciled",
+            price=price,
+            amount=held_amount,
+            cost_usd=usd_value,
+            payload={"note": "entry_price is a best-effort estimate from current price"},
+        )
 
 
 load_dotenv()
@@ -366,6 +486,20 @@ use_limit_orders = os.getenv("TRADING_USE_LIMIT_ORDERS", "false").lower() == "tr
 limit_order_offset_pct = float(os.getenv("TRADING_LIMIT_ORDER_OFFSET", "0.001"))
 log_signal_checks = os.getenv("TRADING_LOG_SIGNAL_CHECKS", "true").lower() == "true"
 snapshot_interval_minutes = int(os.getenv("TRADING_PORTFOLIO_SNAPSHOT_MINUTES", "30"))
+
+# Risk guardrails (set any to 0 to disable that specific limit).
+# Trade counts and the loss limit are tracked PER COIN.
+max_open_positions = int(os.getenv("TRADING_MAX_OPEN_POSITIONS", "3"))
+max_trades_per_day = int(os.getenv("TRADING_MAX_TRADES_PER_DAY", "0"))
+max_trades_per_symbol_per_day = int(os.getenv("TRADING_MAX_TRADES_PER_SYMBOL_PER_DAY", "6"))
+daily_loss_limit_pct = float(os.getenv("TRADING_DAILY_LOSS_LIMIT_PCT", "0.05"))
+# Re-entries on a coin must present a signal at least as strong as its previous entry.
+require_stronger_reentry = os.getenv("TRADING_REQUIRE_STRONGER_REENTRY", "true").lower() == "true"
+min_setup_improvement = float(os.getenv("TRADING_MIN_SETUP_IMPROVEMENT", "0.0"))
+reconcile_on_start = os.getenv("TRADING_RECONCILE_ON_START", "true").lower() == "true"
+reconcile_min_value_usd = float(
+    os.getenv("TRADING_RECONCILE_MIN_USD", os.getenv("MIN_POSITION_VALUE_USD", "5.00"))
+)
 
 core_symbols = set(parse_symbol_list(os.getenv("TRADING_CORE_SYMBOLS", "ETH/USD,BTC/USD")))
 tactical_symbols = set(parse_symbol_list(os.getenv("TRADING_TACTICAL_SYMBOLS", "LINK/USD,SHIB/USD")))
@@ -451,6 +585,12 @@ except Exception as exc:
     )
     print(f"⚠️  Could not set leverage automatically: {exc}")
 
+if leverage > 1:
+    print(
+        f"⚠️  TRADING_LEVERAGE={leverage}. Coinbase Advanced Trade spot has no leverage; "
+        "set TRADING_LEVERAGE=1 unless you are certain your account supports margin."
+    )
+
 positions = {}
 for symbol in symbols:
     positions[symbol] = {
@@ -463,6 +603,19 @@ for symbol in symbols:
         "trailing_profit_target": 0.0,
         "last_exit_time": 0,
     }
+
+if reconcile_on_start:
+    print("♻️  Reconciling existing exchange positions...")
+    reconcile_open_positions(
+        exchange,
+        symbols,
+        positions,
+        symbol_profiles,
+        profile_settings,
+        timeframe,
+        reconcile_min_value_usd,
+        journal,
+    )
 
 print(f"🛡️ Active. Risking {risk_pct * 100:.1f}% total across {len(symbols)} symbols.")
 print(f"🧭 Market regime guardrails use {', '.join(benchmark_symbols)} on {regime_timeframe} candles.")
@@ -486,6 +639,14 @@ for symbol in symbols:
     )
 print(f"⏸️  Cooldown Period: {cooldown_minutes} minutes after exit")
 print(f"⏱️  Check Interval: {check_interval} seconds")
+print(
+    "🚧 Daily guardrails (per coin): "
+    f"max_open={max_open_positions or 'off'} "
+    f"max_trades/coin={max_trades_per_symbol_per_day or 'off'} "
+    f"max_trades/day_total={max_trades_per_day or 'off'} "
+    f"loss_limit/coin={format_pct(daily_loss_limit_pct) if daily_loss_limit_pct > 0 else 'off'} "
+    f"stronger_reentry={'on' if require_stronger_reentry else 'off'}"
+)
 if enable_trading:
     print("⚠️  TRADING ENABLED - Real orders will be executed!")
 else:
@@ -505,8 +666,11 @@ journal.log_event(
     },
 )
 
+daily_state = new_daily_state(current_day_key())
+
 try:
     initial_snapshot = fetch_portfolio_snapshot(exchange)
+    daily_state["start_equity_usd"] = initial_snapshot["total_estimated_usd"]
     journal.log_portfolio_snapshot(
         total_estimated_usd=initial_snapshot["total_estimated_usd"],
         free_usd=initial_snapshot["free_usd"],
@@ -525,6 +689,7 @@ last_regime_label = None
 last_snapshot_time = time.time()
 
 while True:
+    roll_daily_state_if_needed(daily_state, exchange, journal)
     regime_label, regime_snapshots = get_regime_state(exchange, benchmark_symbols, regime_timeframe)
     if regime_label != last_regime_label:
         print(f"🌡️ Market Regime: {regime_label.upper()}")
@@ -597,6 +762,47 @@ while True:
                 regime_allowed = regime_label in profile["allowed_regimes"]
                 blocked_reasons = []
 
+                open_positions_count = sum(
+                    1 for state in positions.values() if state["in_position"]
+                )
+
+                current_signal = {
+                    "rsi": rsi,
+                    "trend_strength": trend_strength,
+                    "volume_ratio": volume_ratio,
+                }
+                limit_reasons = evaluate_entry_limits(
+                    daily_state,
+                    symbol,
+                    open_positions_count,
+                    max_open_positions,
+                    max_trades_per_day,
+                    max_trades_per_symbol_per_day,
+                    daily_loss_limit_pct,
+                    require_stronger_setup=require_stronger_reentry,
+                    current_signal=current_signal,
+                    min_setup_improvement=min_setup_improvement,
+                )
+                # Latch the per-coin halt the first time a coin breaches its loss budget.
+                if "daily_loss_limit" in limit_reasons and not daily_state["symbol_halted"].get(symbol):
+                    daily_state["symbol_halted"][symbol] = True
+                    print(
+                        f"[{base_currency}] 🛑 Per-coin daily loss limit reached "
+                        f"(realized {format_price(daily_state['symbol_realized_pnl_usd'].get(symbol, 0.0))}). "
+                        "Pausing new entries for this coin until tomorrow."
+                    )
+                    journal.log_event(
+                        "daily_loss_limit_triggered",
+                        symbol=symbol,
+                        profile=profile_name,
+                        status="halted",
+                        payload={
+                            "symbol_realized_pnl_usd": daily_state["symbol_realized_pnl_usd"].get(symbol, 0.0),
+                            "start_equity_usd": daily_state["start_equity_usd"],
+                            "loss_limit_pct": daily_loss_limit_pct,
+                        },
+                    )
+                blocked_reasons.extend(limit_reasons)
                 if cooldown_active:
                     blocked_reasons.append("cooldown_active")
                 if not regime_allowed:
@@ -671,7 +877,7 @@ while True:
                         )
                         continue
 
-                    entry_executed = place_entry_order(
+                    entry_executed, filled_amount, fill_price = place_entry_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -683,13 +889,16 @@ while True:
                     )
 
                     if entry_executed:
-                        pos["trailing_stop_price"] = price - (atr * dynamic_atr_multiplier)
-                        pos["position_amount"] = amount
-                        pos["entry_price"] = price
-                        pos["peak_price"] = price
-                        pos["trailing_profit_target"] = price * (1 + dynamic_profit_target)
+                        effective_price = fill_price if fill_price and fill_price > 0 else price
+                        effective_amount = filled_amount if filled_amount and filled_amount > 0 else amount
+                        pos["trailing_stop_price"] = effective_price - (atr * dynamic_atr_multiplier)
+                        pos["position_amount"] = effective_amount
+                        pos["entry_price"] = effective_price
+                        pos["peak_price"] = effective_price
+                        pos["trailing_profit_target"] = effective_price * (1 + dynamic_profit_target)
                         pos["in_position"] = True
                         pos["breakeven_set"] = False
+                        record_trade(daily_state, symbol, signal=current_signal)
                         journal.log_event(
                             "entry_executed",
                             symbol=symbol,
@@ -697,8 +906,8 @@ while True:
                             regime=regime_label,
                             side="buy",
                             status="executed",
-                            price=price,
-                            amount=amount,
+                            price=effective_price,
+                            amount=effective_amount,
                             cost_usd=cost,
                             payload={
                                 "rsi": rsi,
@@ -784,6 +993,7 @@ while True:
                                 "drop_from_peak_pct": drop_from_peak_pct,
                             },
                         )
+                        record_realized_pnl(daily_state, symbol, (price - entry_price) * pos["position_amount"])
                         reset_position_state(pos, record_exit=True)
                         continue
                     journal.log_event(
@@ -833,6 +1043,7 @@ while True:
                                 "target_price": profit_target_price,
                             },
                         )
+                        record_realized_pnl(daily_state, symbol, (price - entry_price) * pos["position_amount"])
                         reset_position_state(pos, record_exit=True)
                         continue
                     journal.log_event(
@@ -881,6 +1092,7 @@ while True:
                                 "trailing_profit_target": pos["trailing_profit_target"],
                             },
                         )
+                        record_realized_pnl(daily_state, symbol, (price - entry_price) * pos["position_amount"])
                         reset_position_state(pos, record_exit=True)
                         continue
                     journal.log_event(
@@ -956,6 +1168,7 @@ while True:
                                 "stop_price": pos["trailing_stop_price"],
                             },
                         )
+                        record_realized_pnl(daily_state, symbol, (price - entry_price) * pos["position_amount"])
                         reset_position_state(pos, record_exit=True)
                     else:
                         journal.log_event(

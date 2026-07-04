@@ -11,7 +11,14 @@ def main() -> int:
     app_role = os.getenv("APP_ROLE", "bot").strip().lower()
 
     if app_role == "bot":
-        command = [sys.executable, "main_multi_symbol.py", "--execute"]
+        command = [sys.executable, "main_multi_symbol.py"]
+        # Live trading is opt-in. Deploy runs in simulation until BOT_EXECUTE=true,
+        # so you can verify the deployment before risking real funds.
+        if os.getenv("BOT_EXECUTE", "false").lower() == "true":
+            command.append("--execute")
+            print("app_entrypoint: BOT_EXECUTE=true -> LIVE trading enabled")
+        else:
+            print("app_entrypoint: BOT_EXECUTE not set -> running in SIMULATION mode")
     elif app_role == "daily_report_email":
         command = [sys.executable, "daily_report.py", "--yesterday", "--email"]
         if os.getenv("REPORT_STDOUT", "false").lower() == "true":
