@@ -93,11 +93,12 @@ Render offers a free tier perfect for testing.
    - **Name**: `coinbase-trading-bot`
    - **Environment**: `Python 3`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python main_multi_symbol.py --execute`
+   - **Start Command**: `python app_entrypoint.py`
 
 4. **Add Environment Variables**
    - Scroll to "Environment Variables"
    - Add all variables (same as Railway above)
+   - Keep `BOT_EXECUTE=false` for simulation; set `BOT_EXECUTE=true` only when you are ready for live orders.
 
 5. **Deploy**
    - Click "Create Web Service"

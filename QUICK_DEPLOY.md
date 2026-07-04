@@ -53,8 +53,8 @@ In Railway dashboard:
    - **Name**: `coinbase-bot`
    - **Environment**: `Python 3`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python main.py --execute`
-6. Add environment variables (same as Railway)
+   - **Start Command**: `python app_entrypoint.py`
+6. Add environment variables (same as Railway). Leave `BOT_EXECUTE=false` for simulation; set it to `true` only when you are ready for live orders.
 7. Click "Create Web Service"
 
 **Note**: Free tier spins down after inactivity. Upgrade to "Starter" ($7/mo) for always-on.
