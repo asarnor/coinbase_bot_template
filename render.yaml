@@ -25,5 +25,5 @@ services:
       - key: TRADING_CHECK_INTERVAL
         value: 60
       - key: BOT_EXECUTE
-        value: false
+        value: "false"
 
