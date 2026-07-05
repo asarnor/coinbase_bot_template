@@ -9,7 +9,9 @@ Daily limits are tracked PER COIN: each symbol gets its own trade counter, reali
 P&L tally, and loss-limit halt. A losing or maxed-out coin is paused for the rest of
 the UTC day while the other coins keep trading normally.
 """
-from datetime import datetime, timezone
+import json
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 
@@ -17,6 +19,13 @@ def current_day_key(now: Optional[datetime] = None) -> str:
     """Return the current UTC day as an YYYY-MM-DD string (used to reset counters)."""
     moment = now or datetime.now(timezone.utc)
     return moment.strftime("%Y-%m-%d")
+
+
+def utc_day_bounds_iso(day: str) -> Tuple[str, str]:
+    """Return inclusive start and exclusive end ISO timestamps for a UTC day key."""
+    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
 
 
 def new_daily_state(day: str, start_equity_usd: float = 0.0) -> Dict:
@@ -60,6 +69,87 @@ def record_realized_pnl(state: Dict, symbol: str, pnl_usd: float) -> None:
     state["symbol_realized_pnl_usd"][symbol] = (
         state["symbol_realized_pnl_usd"].get(symbol, 0.0) + pnl_usd
     )
+
+
+def _coerce_float(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _event_payload(event: Dict) -> Dict:
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        return payload
+
+    raw_payload = event.get("payload_json")
+    if isinstance(raw_payload, dict):
+        return raw_payload
+    if not raw_payload:
+        return {}
+
+    try:
+        payload = json.loads(raw_payload)
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def restore_daily_state_from_events(
+    day: str,
+    events: List[Dict],
+    start_equity_usd: float = 0.0,
+) -> Dict:
+    """Rebuild today's risk counters from persisted journal events.
+
+    The live bot keeps daily guardrails in memory while running. Replaying the
+    journal on startup prevents restarts from clearing trade counts, realized P&L,
+    stronger-reentry baselines, or latched loss-limit halts.
+    """
+    state = new_daily_state(day, _coerce_float(start_equity_usd, 0.0))
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+
+        event_type = event.get("event_type")
+        symbol = event.get("symbol")
+        payload = _event_payload(event)
+
+        if event_type == "entry_executed" and symbol:
+            signal = {
+                key: _coerce_float(payload.get(key), 0.0)
+                for key in ("rsi", "trend_strength", "volume_ratio")
+                if payload.get(key) is not None
+            }
+            record_trade(state, symbol, signal=signal or None)
+        elif event_type == "exit_executed" and symbol:
+            pnl_usd = _coerce_float(payload.get("estimated_pnl_usd"), 0.0)
+            if pnl_usd:
+                record_realized_pnl(state, symbol, pnl_usd)
+        elif event_type == "daily_loss_limit_triggered" and symbol:
+            state["symbol_halted"][symbol] = True
+
+            persisted_symbol_pnl = payload.get("symbol_realized_pnl_usd")
+            if persisted_symbol_pnl is not None:
+                restored_pnl = _coerce_float(
+                    persisted_symbol_pnl,
+                    state["symbol_realized_pnl_usd"].get(symbol, 0.0),
+                )
+                current_pnl = state["symbol_realized_pnl_usd"].get(symbol, 0.0)
+                delta = restored_pnl - current_pnl
+                if delta:
+                    state["symbol_realized_pnl_usd"][symbol] = restored_pnl
+                    state["realized_pnl_usd"] += delta
+
+            if state.get("start_equity_usd", 0.0) <= 0:
+                payload_start_equity = _coerce_float(payload.get("start_equity_usd"), 0.0)
+                if payload_start_equity > 0:
+                    state["start_equity_usd"] = payload_start_equity
+
+    return state
 
 
 def symbol_trade_count(state: Dict, symbol: str) -> int:
@@ -187,6 +277,8 @@ def evaluate_entry_limits(
     """
     reasons: List[str] = []
 
+    if daily_loss_limit_pct > 0 and state.get("start_equity_usd", 0) <= 0:
+        reasons.append("daily_loss_equity_unavailable")
     if state["symbol_halted"].get(symbol) or symbol_loss_limit_hit(
         state, symbol, daily_loss_limit_pct
     ):

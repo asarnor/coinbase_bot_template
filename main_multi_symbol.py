@@ -20,11 +20,11 @@ from risk_limits import (
     current_day_key,
     evaluate_entry_limits,
     extract_fill,
-    new_daily_state,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
-    symbol_loss_limit_hit,
+    restore_daily_state_from_events,
+    utc_day_bounds_iso,
 )
 from trading_journal import TradingJournal
 
@@ -360,6 +360,28 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         return 0, 0
 
 
+def load_daily_state_from_journal(journal, day: str) -> Dict:
+    start_iso, end_iso = utc_day_bounds_iso(day)
+    start_equity_usd = 0.0
+    try:
+        first_snapshot = journal.get_first_snapshot_after(start_iso)
+        if first_snapshot:
+            start_equity_usd = float(first_snapshot.get("total_estimated_usd") or 0.0)
+    except Exception as exc:
+        print(f"⚠️  Could not load start-of-day snapshot from journal: {exc}")
+
+    events = journal.get_events_between(start_iso, end_iso)
+    state = restore_daily_state_from_events(day, events, start_equity_usd)
+    halted_symbols = [symbol for symbol, halted in state["symbol_halted"].items() if halted]
+    if state["trades"] or state["realized_pnl_usd"] or halted_symbols:
+        print(
+            "♻️  Restored daily guardrails from journal: "
+            f"trades={state['trades']} realized_pnl=${state['realized_pnl_usd']:.2f} "
+            f"halted={halted_symbols or 'none'}"
+        )
+    return state
+
+
 def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
     today = current_day_key()
     if today == state["day"]:
@@ -377,12 +399,23 @@ def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
             "halted_symbols": [s for s, v in state["symbol_halted"].items() if v],
         },
     )
-    start_equity = state.get("start_equity_usd", 0.0)
+    start_equity = 0.0
     try:
         snap = fetch_portfolio_snapshot(exchange)
         start_equity = snap["total_estimated_usd"]
-    except Exception:
-        pass
+        journal.log_portfolio_snapshot(
+            total_estimated_usd=snap["total_estimated_usd"],
+            free_usd=snap["free_usd"],
+            invested_usd=snap["invested_usd"],
+            positions=snap["positions"],
+        )
+    except Exception as exc:
+        journal.log_event(
+            "warning",
+            reason="daily_reset_snapshot_failed",
+            status="warning",
+            payload={"message": str(exc)},
+        )
     reset_daily_state(state, today, start_equity)
 
 
@@ -681,11 +714,12 @@ journal.log_event(
     },
 )
 
-daily_state = new_daily_state(current_day_key())
+daily_state = load_daily_state_from_journal(journal, current_day_key())
 
 try:
     initial_snapshot = fetch_portfolio_snapshot(exchange)
-    daily_state["start_equity_usd"] = initial_snapshot["total_estimated_usd"]
+    if daily_state.get("start_equity_usd", 0.0) <= 0:
+        daily_state["start_equity_usd"] = initial_snapshot["total_estimated_usd"]
     journal.log_portfolio_snapshot(
         total_estimated_usd=initial_snapshot["total_estimated_usd"],
         free_usd=initial_snapshot["free_usd"],
@@ -1221,6 +1255,8 @@ while True:
                 invested_usd=snapshot["invested_usd"],
                 positions=snapshot["positions"],
             )
+            if daily_state.get("start_equity_usd", 0.0) <= 0:
+                daily_state["start_equity_usd"] = snapshot["total_estimated_usd"]
             last_snapshot_time = time.time()
         except Exception as exc:
             journal.log_event(
