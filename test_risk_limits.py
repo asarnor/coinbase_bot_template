@@ -3,6 +3,7 @@
 
 Run with:  python -m unittest test_risk_limits    (no extra dependencies required)
 """
+import json
 import unittest
 from datetime import datetime, timezone
 
@@ -15,10 +16,12 @@ from risk_limits import (
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    restore_daily_state_from_events,
     setup_is_stronger,
     symbol_loss_limit_hit,
     symbol_realized_pnl,
     symbol_trade_count,
+    utc_day_bounds_iso,
 )
 
 
@@ -91,6 +94,11 @@ class DailyStateTests(unittest.TestCase):
         moment = datetime(2026, 7, 3, 23, 59, tzinfo=timezone.utc)
         self.assertEqual(current_day_key(moment), "2026-07-03")
 
+    def test_utc_day_bounds_iso(self):
+        start_iso, end_iso = utc_day_bounds_iso("2026-07-03")
+        self.assertEqual(start_iso, "2026-07-03T00:00:00+00:00")
+        self.assertEqual(end_iso, "2026-07-04T00:00:00+00:00")
+
     def test_record_trade_tracks_per_coin(self):
         state = new_daily_state("2026-07-03", start_equity_usd=1000)
         record_trade(state, "BTC/USD")
@@ -119,6 +127,53 @@ class DailyStateTests(unittest.TestCase):
         self.assertEqual(state["symbol_realized_pnl_usd"], {})
         self.assertEqual(state["symbol_halted"], {})
         self.assertAlmostEqual(state["start_equity_usd"], 1200)
+
+
+class RestoreDailyStateTests(unittest.TestCase):
+    def test_replays_trades_pnl_signals_and_latched_halts(self):
+        events = [
+            {
+                "event_type": "entry_executed",
+                "symbol": "BTC/USD",
+                "payload_json": json.dumps(
+                    {"rsi": 61.0, "trend_strength": 0.03, "volume_ratio": 1.8}
+                ),
+            },
+            {
+                "event_type": "entry_executed",
+                "symbol": "ETH/USD",
+                "payload": {"rsi": 58.0, "trend_strength": 0.02, "volume_ratio": 1.4},
+            },
+            {
+                "event_type": "exit_executed",
+                "symbol": "BTC/USD",
+                "payload_json": json.dumps({"estimated_pnl_usd": -40.0}),
+            },
+            {
+                "event_type": "daily_loss_limit_triggered",
+                "symbol": "BTC/USD",
+                "payload_json": json.dumps(
+                    {
+                        "symbol_realized_pnl_usd": -55.0,
+                        "start_equity_usd": 1000.0,
+                    }
+                ),
+            },
+        ]
+
+        state = restore_daily_state_from_events("2026-07-03", events)
+
+        self.assertEqual(state["trades"], 2)
+        self.assertEqual(symbol_trade_count(state, "BTC/USD"), 1)
+        self.assertEqual(symbol_trade_count(state, "ETH/USD"), 1)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "BTC/USD"), -55.0)
+        self.assertAlmostEqual(state["realized_pnl_usd"], -55.0)
+        self.assertTrue(state["symbol_halted"]["BTC/USD"])
+        self.assertAlmostEqual(state["start_equity_usd"], 1000.0)
+        self.assertEqual(
+            state["symbol_last_entry_signal"]["BTC/USD"],
+            {"rsi": 61.0, "trend_strength": 0.03, "volume_ratio": 1.8},
+        )
 
 
 class SymbolLossLimitTests(unittest.TestCase):
@@ -195,6 +250,16 @@ class EvaluateEntryLimitsTests(unittest.TestCase):
         state["symbol_halted"]["BTC/USD"] = True
         reasons = evaluate_entry_limits(state, "BTC/USD", 0, 3, 0, 6, 0.05)
         self.assertIn("daily_loss_limit", reasons)
+
+    def test_blocks_when_loss_limit_enabled_without_equity_baseline(self):
+        state = new_daily_state("2026-07-03", start_equity_usd=0)
+        reasons = evaluate_entry_limits(state, "BTC/USD", 0, 3, 0, 6, 0.05)
+        self.assertIn("daily_loss_equity_unavailable", reasons)
+
+    def test_no_equity_baseline_is_allowed_when_loss_limit_disabled(self):
+        state = new_daily_state("2026-07-03", start_equity_usd=0)
+        reasons = evaluate_entry_limits(state, "BTC/USD", 0, 3, 0, 6, 0)
+        self.assertNotIn("daily_loss_equity_unavailable", reasons)
 
     def test_optional_global_daily_cap(self):
         state = self._state()
