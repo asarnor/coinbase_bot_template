@@ -16,6 +16,7 @@ from risk_limits import (
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    resolve_effective_leverage,
     restore_daily_state_from_events,
     setup_is_stronger,
     symbol_loss_limit_hit,
@@ -57,6 +58,17 @@ class ComputePositionSizeTests(unittest.TestCase):
         amount, cost = compute_position_size(free_usd=1000, price=100, risk_slice=0.1, leverage=0)
         self.assertAlmostEqual(cost, 100.0)
         self.assertAlmostEqual(amount, 1.0)
+
+
+class ResolveEffectiveLeverageTests(unittest.TestCase):
+    def test_uses_requested_leverage_after_successful_setup(self):
+        self.assertEqual(resolve_effective_leverage(5, setup_succeeded=True), 5)
+
+    def test_falls_back_to_spot_sizing_when_setup_fails(self):
+        self.assertEqual(resolve_effective_leverage(5, setup_succeeded=False), 1.0)
+
+    def test_never_returns_less_than_one_after_successful_setup(self):
+        self.assertEqual(resolve_effective_leverage(0, setup_succeeded=True), 1.0)
 
 
 class ExtractFillTests(unittest.TestCase):
