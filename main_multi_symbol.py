@@ -24,6 +24,7 @@ from risk_limits import (
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    resolve_effective_leverage,
     restore_daily_state_from_events,
 )
 from trading_journal import TradingJournal
@@ -624,11 +625,13 @@ except Exception as exc:
     print(f"❌ Connection Error: {exc}")
     sys.exit()
 
+leverage_setup_succeeded = True
 try:
     for symbol in symbols:
         exchange.set_leverage(leverage, symbol)
     print(f"⚡ Leverage set to {leverage}x for all symbols.")
 except Exception as exc:
+    leverage_setup_succeeded = False
     journal.log_event(
         "warning",
         reason="set_leverage_not_supported",
@@ -637,11 +640,15 @@ except Exception as exc:
     )
     print(f"⚠️  Could not set leverage automatically: {exc}")
 
+effective_leverage = resolve_effective_leverage(leverage, leverage_setup_succeeded)
+
 if leverage > 1:
     print(
         f"⚠️  TRADING_LEVERAGE={leverage}. Coinbase Advanced Trade spot has no leverage; "
         "set TRADING_LEVERAGE=1 unless you are certain your account supports margin."
     )
+    if effective_leverage == 1:
+        print("🛡️ Leverage setup failed; sizing new entries with 1x spot buying power.")
 
 positions = {}
 for symbol in symbols:
@@ -713,6 +720,7 @@ journal.log_event(
         "regime_symbols": benchmark_symbols,
         "risk_pct": risk_pct,
         "leverage": leverage,
+        "effective_leverage": effective_leverage,
         "enable_trading": enable_trading,
         "journal_backend": journal.describe_backend(),
     },
@@ -894,7 +902,9 @@ while True:
 
                 if price_above_ema and rsi_strong and trend_strong_enough and ema_trending_up and volume_adequate:
                     risk_slice = risk_pct * symbol_weights[symbol] / total_risk_weight
-                    amount, cost = get_position_size(exchange, symbol, price, risk_slice, leverage)
+                    amount, cost = get_position_size(
+                        exchange, symbol, price, risk_slice, effective_leverage
+                    )
 
                     if cost < min_order_size:
                         journal.log_event(

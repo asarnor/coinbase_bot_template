@@ -161,6 +161,13 @@ def compute_position_size(
     return amount, cost
 
 
+def resolve_effective_leverage(requested_leverage: float, setup_succeeded: bool) -> float:
+    """Use requested leverage only after the exchange confirms leverage is active."""
+    if not setup_succeeded:
+        return 1.0
+    return max(requested_leverage, 1.0)
+
+
 def extract_fill(
     order: Optional[Dict], fallback_amount: float, fallback_price: float
 ) -> Tuple[float, float]:
