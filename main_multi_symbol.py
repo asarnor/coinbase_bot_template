@@ -18,13 +18,13 @@ from portfolio_utils import fetch_portfolio_snapshot
 from risk_limits import (
     compute_position_size,
     current_day_key,
+    daily_utc_bounds,
     evaluate_entry_limits,
     extract_fill,
-    new_daily_state,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
-    symbol_loss_limit_hit,
+    restore_daily_state_from_events,
 )
 from trading_journal import TradingJournal
 
@@ -360,6 +360,46 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         return 0, 0
 
 
+def load_start_equity_from_journal(journal, day: str) -> float:
+    start_iso, _ = daily_utc_bounds(day)
+    snapshot = journal.get_first_snapshot_after(start_iso)
+    if not snapshot:
+        return 0.0
+
+    try:
+        return float(snapshot.get("total_estimated_usd") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def initialize_daily_state(exchange, journal, day: str) -> Dict:
+    start_iso, end_iso = daily_utc_bounds(day)
+    start_equity = load_start_equity_from_journal(journal, day)
+
+    if start_equity > 0:
+        print(f"🛡️ Restored start-of-day equity from journal: {format_price(start_equity)}")
+    else:
+        try:
+            snapshot = fetch_portfolio_snapshot(exchange)
+            start_equity = snapshot["total_estimated_usd"]
+            journal.log_portfolio_snapshot(
+                total_estimated_usd=snapshot["total_estimated_usd"],
+                free_usd=snapshot["free_usd"],
+                invested_usd=snapshot["invested_usd"],
+                positions=snapshot["positions"],
+            )
+        except Exception as exc:
+            journal.log_event(
+                "warning",
+                reason="initial_snapshot_failed",
+                status="warning",
+                payload={"message": str(exc)},
+            )
+
+    events = journal.get_events_between(start_iso, end_iso)
+    return restore_daily_state_from_events(day, events, start_equity)
+
+
 def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
     today = current_day_key()
     if today == state["day"]:
@@ -377,13 +417,10 @@ def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
             "halted_symbols": [s for s, v in state["symbol_halted"].items() if v],
         },
     )
-    start_equity = state.get("start_equity_usd", 0.0)
-    try:
-        snap = fetch_portfolio_snapshot(exchange)
-        start_equity = snap["total_estimated_usd"]
-    except Exception:
-        pass
-    reset_daily_state(state, today, start_equity)
+    reset_daily_state(state, today, 0.0)
+    restored_state = initialize_daily_state(exchange, journal, today)
+    state.clear()
+    state.update(restored_state)
 
 
 def reconcile_open_positions(
@@ -681,23 +718,20 @@ journal.log_event(
     },
 )
 
-daily_state = new_daily_state(current_day_key())
-
-try:
-    initial_snapshot = fetch_portfolio_snapshot(exchange)
-    daily_state["start_equity_usd"] = initial_snapshot["total_estimated_usd"]
-    journal.log_portfolio_snapshot(
-        total_estimated_usd=initial_snapshot["total_estimated_usd"],
-        free_usd=initial_snapshot["free_usd"],
-        invested_usd=initial_snapshot["invested_usd"],
-        positions=initial_snapshot["positions"],
-    )
-except Exception as exc:
+daily_state = initialize_daily_state(exchange, journal, current_day_key())
+if daily_loss_limit_pct > 0 and daily_state.get("start_equity_usd", 0) <= 0:
     journal.log_event(
         "warning",
-        reason="initial_snapshot_failed",
+        reason="daily_loss_equity_unavailable",
         status="warning",
-        payload={"message": str(exc)},
+        payload={
+            "message": "Daily loss limit is enabled but no start-of-day equity baseline is available; new entries will be blocked.",
+            "loss_limit_pct": daily_loss_limit_pct,
+        },
+    )
+    print(
+        "🛑 Daily loss guardrail has no start-of-day equity baseline; "
+        "blocking new entries until a portfolio snapshot is available."
     )
 
 last_regime_label = None
