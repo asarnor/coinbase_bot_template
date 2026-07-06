@@ -18,13 +18,14 @@ from portfolio_utils import fetch_portfolio_snapshot
 from risk_limits import (
     compute_position_size,
     current_day_key,
+    daily_utc_bounds,
     evaluate_entry_limits,
     extract_fill,
-    new_daily_state,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
-    symbol_loss_limit_hit,
+    resolve_effective_leverage,
+    restore_daily_state_from_events,
 )
 from trading_journal import TradingJournal
 
@@ -360,6 +361,46 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         return 0, 0
 
 
+def load_start_equity_from_journal(journal, day: str) -> float:
+    start_iso, _ = daily_utc_bounds(day)
+    snapshot = journal.get_first_snapshot_after(start_iso)
+    if not snapshot:
+        return 0.0
+
+    try:
+        return float(snapshot.get("total_estimated_usd") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def initialize_daily_state(exchange, journal, day: str) -> Dict:
+    start_iso, end_iso = daily_utc_bounds(day)
+    start_equity = load_start_equity_from_journal(journal, day)
+
+    if start_equity > 0:
+        print(f"🛡️ Restored start-of-day equity from journal: {format_price(start_equity)}")
+    else:
+        try:
+            snapshot = fetch_portfolio_snapshot(exchange)
+            start_equity = snapshot["total_estimated_usd"]
+            journal.log_portfolio_snapshot(
+                total_estimated_usd=snapshot["total_estimated_usd"],
+                free_usd=snapshot["free_usd"],
+                invested_usd=snapshot["invested_usd"],
+                positions=snapshot["positions"],
+            )
+        except Exception as exc:
+            journal.log_event(
+                "warning",
+                reason="initial_snapshot_failed",
+                status="warning",
+                payload={"message": str(exc)},
+            )
+
+    events = journal.get_events_between(start_iso, end_iso)
+    return restore_daily_state_from_events(day, events, start_equity)
+
+
 def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
     today = current_day_key()
     if today == state["day"]:
@@ -377,13 +418,10 @@ def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
             "halted_symbols": [s for s, v in state["symbol_halted"].items() if v],
         },
     )
-    start_equity = state.get("start_equity_usd", 0.0)
-    try:
-        snap = fetch_portfolio_snapshot(exchange)
-        start_equity = snap["total_estimated_usd"]
-    except Exception:
-        pass
-    reset_daily_state(state, today, start_equity)
+    reset_daily_state(state, today, 0.0)
+    restored_state = initialize_daily_state(exchange, journal, today)
+    state.clear()
+    state.update(restored_state)
 
 
 def reconcile_open_positions(
@@ -587,11 +625,13 @@ except Exception as exc:
     print(f"❌ Connection Error: {exc}")
     sys.exit()
 
+leverage_setup_succeeded = True
 try:
     for symbol in symbols:
         exchange.set_leverage(leverage, symbol)
     print(f"⚡ Leverage set to {leverage}x for all symbols.")
 except Exception as exc:
+    leverage_setup_succeeded = False
     journal.log_event(
         "warning",
         reason="set_leverage_not_supported",
@@ -600,11 +640,15 @@ except Exception as exc:
     )
     print(f"⚠️  Could not set leverage automatically: {exc}")
 
+effective_leverage = resolve_effective_leverage(leverage, leverage_setup_succeeded)
+
 if leverage > 1:
     print(
         f"⚠️  TRADING_LEVERAGE={leverage}. Coinbase Advanced Trade spot has no leverage; "
         "set TRADING_LEVERAGE=1 unless you are certain your account supports margin."
     )
+    if effective_leverage == 1:
+        print("🛡️ Leverage setup failed; sizing new entries with 1x spot buying power.")
 
 positions = {}
 for symbol in symbols:
@@ -676,28 +720,26 @@ journal.log_event(
         "regime_symbols": benchmark_symbols,
         "risk_pct": risk_pct,
         "leverage": leverage,
+        "effective_leverage": effective_leverage,
         "enable_trading": enable_trading,
         "journal_backend": journal.describe_backend(),
     },
 )
 
-daily_state = new_daily_state(current_day_key())
-
-try:
-    initial_snapshot = fetch_portfolio_snapshot(exchange)
-    daily_state["start_equity_usd"] = initial_snapshot["total_estimated_usd"]
-    journal.log_portfolio_snapshot(
-        total_estimated_usd=initial_snapshot["total_estimated_usd"],
-        free_usd=initial_snapshot["free_usd"],
-        invested_usd=initial_snapshot["invested_usd"],
-        positions=initial_snapshot["positions"],
-    )
-except Exception as exc:
+daily_state = initialize_daily_state(exchange, journal, current_day_key())
+if daily_loss_limit_pct > 0 and daily_state.get("start_equity_usd", 0) <= 0:
     journal.log_event(
         "warning",
-        reason="initial_snapshot_failed",
+        reason="daily_loss_equity_unavailable",
         status="warning",
-        payload={"message": str(exc)},
+        payload={
+            "message": "Daily loss limit is enabled but no start-of-day equity baseline is available; new entries will be blocked.",
+            "loss_limit_pct": daily_loss_limit_pct,
+        },
+    )
+    print(
+        "🛑 Daily loss guardrail has no start-of-day equity baseline; "
+        "blocking new entries until a portfolio snapshot is available."
     )
 
 last_regime_label = None
@@ -860,7 +902,9 @@ while True:
 
                 if price_above_ema and rsi_strong and trend_strong_enough and ema_trending_up and volume_adequate:
                     risk_slice = risk_pct * symbol_weights[symbol] / total_risk_weight
-                    amount, cost = get_position_size(exchange, symbol, price, risk_slice, leverage)
+                    amount, cost = get_position_size(
+                        exchange, symbol, price, risk_slice, effective_leverage
+                    )
 
                     if cost < min_order_size:
                         journal.log_event(
