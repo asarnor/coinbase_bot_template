@@ -9,14 +9,22 @@ Daily limits are tracked PER COIN: each symbol gets its own trade counter, reali
 P&L tally, and loss-limit halt. A losing or maxed-out coin is paused for the rest of
 the UTC day while the other coins keep trading normally.
 """
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 def current_day_key(now: Optional[datetime] = None) -> str:
     """Return the current UTC day as an YYYY-MM-DD string (used to reset counters)."""
     moment = now or datetime.now(timezone.utc)
     return moment.strftime("%Y-%m-%d")
+
+
+def daily_utc_bounds(day: str) -> Tuple[str, str]:
+    """Return inclusive/exclusive UTC ISO bounds for a YYYY-MM-DD day key."""
+    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
 
 
 def new_daily_state(day: str, start_equity_usd: float = 0.0) -> Dict:
@@ -70,6 +78,59 @@ def symbol_realized_pnl(state: Dict, symbol: str) -> float:
     return state["symbol_realized_pnl_usd"].get(symbol, 0.0)
 
 
+def _event_payload(event: Dict) -> Dict:
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        return payload
+
+    raw_payload = event.get("payload_json")
+    if isinstance(raw_payload, dict):
+        return raw_payload
+    if isinstance(raw_payload, str) and raw_payload:
+        try:
+            parsed = json.loads(raw_payload)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _as_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def restore_daily_state_from_events(
+    day: str, events: Iterable[Dict], start_equity_usd: float = 0.0
+) -> Dict:
+    """Rebuild daily risk counters from persisted journal events for one UTC day."""
+    state = new_daily_state(day, start_equity_usd)
+
+    for event in events:
+        symbol = event.get("symbol")
+        event_type = event.get("event_type")
+        status = event.get("status")
+        payload = _event_payload(event)
+
+        if event_type == "entry_executed" and symbol and status == "executed":
+            signal = {
+                key: payload[key]
+                for key in ("rsi", "trend_strength", "volume_ratio")
+                if key in payload
+            }
+            record_trade(state, symbol, signal=signal or None)
+        elif event_type == "exit_executed" and symbol and status == "executed":
+            pnl = _as_float(payload.get("estimated_pnl_usd"))
+            if pnl is not None:
+                record_realized_pnl(state, symbol, pnl)
+        elif event_type == "daily_loss_limit_triggered" and symbol:
+            state["symbol_halted"][symbol] = True
+
+    return state
+
+
 def symbol_loss_limit_hit(state: Dict, symbol: str, limit_pct: float) -> bool:
     """True when a single coin's realized loss for the day breaches its own budget.
 
@@ -98,6 +159,13 @@ def compute_position_size(
         cost = spendable_cap
     amount = cost / price
     return amount, cost
+
+
+def resolve_effective_leverage(requested_leverage: float, setup_succeeded: bool) -> float:
+    """Use requested leverage only after the exchange confirms leverage is active."""
+    if not setup_succeeded:
+        return 1.0
+    return max(requested_leverage, 1.0)
 
 
 def extract_fill(
@@ -187,7 +255,9 @@ def evaluate_entry_limits(
     """
     reasons: List[str] = []
 
-    if state["symbol_halted"].get(symbol) or symbol_loss_limit_hit(
+    if daily_loss_limit_pct > 0 and state.get("start_equity_usd", 0) <= 0:
+        reasons.append("daily_loss_equity_unavailable")
+    elif state["symbol_halted"].get(symbol) or symbol_loss_limit_hit(
         state, symbol, daily_loss_limit_pct
     ):
         reasons.append("daily_loss_limit")
