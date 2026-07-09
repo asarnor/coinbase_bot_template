@@ -83,7 +83,7 @@ def fetch_data(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.Da
         return pd.DataFrame()
 
 
-def analyze_market(df: pd.DataFrame) -> pd.Series:
+def analyze_market(df: pd.DataFrame, use_closed_candle: bool = True) -> pd.Series:
     working = df.copy()
     working["ema_20"] = ta.ema(working["close"], length=20)
     working["rsi"] = ta.rsi(working["close"], length=14)
@@ -91,9 +91,11 @@ def analyze_market(df: pd.DataFrame) -> pd.Series:
     working["ema_slope"] = working["ema_20"].diff(5)
     working["volume_ma"] = working["volume"].rolling(20).mean()
     working["volume_ratio"] = working["volume"] / working["volume_ma"]
-    # Use the last CLOSED candle (-2) rather than the still-forming candle (-1)
-    # so signals do not repaint / flip within the current bar.
-    return working.iloc[-2] if len(working) >= 2 else working.iloc[-1]
+    # Entry signals use the last CLOSED candle so they do not repaint within the
+    # current bar; exits use the latest available price for timely stop handling.
+    if use_closed_candle and len(working) >= 2:
+        return working.iloc[-2]
+    return working.iloc[-1]
 
 
 def analyze_regime(df: pd.DataFrame) -> pd.Series:
@@ -515,7 +517,7 @@ def reconcile_open_positions(
         if df.empty or len(df) < 30:
             continue
 
-        row = analyze_market(df)
+        row = analyze_market(df, use_closed_candle=False)
         price = row["close"]
         atr = row["atr"]
         usd_value = held_amount * price
@@ -829,7 +831,9 @@ while True:
             if df.empty or len(df) < 30:
                 continue
 
-            row = analyze_market(df)
+            base_currency = symbol.split("/")[0]
+            pos = positions[symbol]
+            row = analyze_market(df, use_closed_candle=not pos["in_position"])
             price = row["close"]
             ema_20 = row["ema_20"]
             atr = row["atr"]
@@ -837,8 +841,6 @@ while True:
             ema_slope = row.get("ema_slope", 0)
             volume_ratio = row.get("volume_ratio", 1.0)
 
-            base_currency = symbol.split("/")[0]
-            pos = positions[symbol]
             profile_name = symbol_profiles[symbol]
             profile = profile_settings[profile_name]
 
