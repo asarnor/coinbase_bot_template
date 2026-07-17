@@ -141,6 +141,7 @@ Runtime loading behavior:
 | Variable | Purpose | Example / Default |
 | --- | --- | --- |
 | `APP_ROLE` | Selects runtime role for `app_entrypoint.py` | `bot` |
+| `BOT_EXECUTE` | Enables live orders when `APP_ROLE=bot`; leave `false` for simulation | `false` |
 | `COINBASE_API_KEY` | Coinbase API key | required |
 | `COINBASE_API_SECRET` | Coinbase API secret | required |
 | `COINBASE_API_PASSPHRASE` | Optional passphrase | optional |
@@ -313,7 +314,7 @@ This repo is set up to deploy through:
 
 The entrypoint chooses behavior by `APP_ROLE`:
 
-- `bot`: runs `main_multi_symbol.py --execute`
+- `bot`: runs `main_multi_symbol.py` in simulation unless `BOT_EXECUTE=true`
 - `daily_report`: generates yesterday's report
 - `daily_report_email`: generates and emails yesterday's report
 
