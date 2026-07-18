@@ -82,6 +82,14 @@ def analyze_market(df: pd.DataFrame) -> pd.Series:
     return working.iloc[-2] if len(working) >= 2 else working.iloc[-1]
 
 
+def select_evaluation_price(
+    df: pd.DataFrame, signal_row: pd.Series, in_position: bool
+) -> float:
+    """Use stable closed-candle prices for entries and the latest price for exits."""
+    row = df.iloc[-1] if in_position else signal_row
+    return float(row["close"])
+
+
 def analyze_regime(df: pd.DataFrame) -> pd.Series:
     working = df.copy()
     working["ema_50"] = ta.ema(working["close"], length=50)
@@ -422,7 +430,7 @@ def reconcile_open_positions(
             continue
 
         row = analyze_market(df)
-        price = row["close"]
+        price = select_evaluation_price(df, row, in_position=True)
         atr = row["atr"]
         usd_value = held_amount * price
         if usd_value < max(min_value_usd, 1.0):
@@ -728,7 +736,8 @@ while True:
                 continue
 
             row = analyze_market(df)
-            price = row["close"]
+            pos = positions[symbol]
+            price = select_evaluation_price(df, row, pos["in_position"])
             ema_20 = row["ema_20"]
             atr = row["atr"]
             rsi = row["rsi"]
@@ -736,7 +745,6 @@ while True:
             volume_ratio = row.get("volume_ratio", 1.0)
 
             base_currency = symbol.split("/")[0]
-            pos = positions[symbol]
             profile_name = symbol_profiles[symbol]
             profile = profile_settings[profile_name]
 
