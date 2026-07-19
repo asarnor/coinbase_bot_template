@@ -1,4 +1,3 @@
-import ccxt
 import pandas as pd
 import pandas_ta_classic as ta
 import time
@@ -6,6 +5,8 @@ import sys
 import argparse
 import os
 from dotenv import load_dotenv
+
+from coinbase_exchange import resolve_coinbase_exchange_class
 
 # Load base .env file first (for shared config)
 load_dotenv()
@@ -82,19 +83,7 @@ if args.test:
 
 # API SETUP
 try:
-    # Coinbase Advanced Trade is `ccxt.coinbase` in current ccxt; sandbox uses
-    # coinbaseexchange. Resolve defensively so a missing alias does not raise.
-    if use_sandbox:
-        _preferred_ids = ["coinbaseexchange", "coinbase", "coinbaseadvanced"]
-    else:
-        _preferred_ids = ["coinbase", "coinbaseadvanced", "coinbaseexchange"]
-    ExchangeClass = None
-    for _candidate_id in _preferred_ids:
-        ExchangeClass = getattr(ccxt, _candidate_id, None)
-        if ExchangeClass is not None:
-            break
-    if ExchangeClass is None:
-        raise AttributeError("No Coinbase exchange class found in ccxt. Run: pip install -U ccxt")
+    ExchangeClass, exchange_id = resolve_coinbase_exchange_class(use_sandbox)
     
     # Build exchange config
     # Note: Sandbox (coinbaseexchange) requires password field even if empty
@@ -118,7 +107,7 @@ try:
     
     exchange = ExchangeClass(exchange_config)
     # Check connection
-    print(f"🔌 Connecting to {'SANDBOX' if use_sandbox else 'PRODUCTION'}...")
+    print(f"🔌 Connecting to {'SANDBOX' if use_sandbox else 'PRODUCTION'} via ccxt.{exchange_id}...")
     exchange.load_markets()
     print("✅ Connected to Coinbase Advanced Trade successfully.")
     

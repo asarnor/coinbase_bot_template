@@ -9,11 +9,11 @@ import sys
 import time
 from typing import Dict, List, Tuple
 
-import ccxt
 import pandas as pd
 import pandas_ta_classic as ta
 from dotenv import load_dotenv
 
+from coinbase_exchange import resolve_coinbase_exchange_class
 from portfolio_utils import fetch_portfolio_snapshot
 from risk_limits import (
     compute_position_size,
@@ -529,25 +529,7 @@ if args.test:
     print("=" * 60)
 
 try:
-    # Coinbase Advanced Trade is exposed as `ccxt.coinbase` in current ccxt versions.
-    # Older aliases (e.g. `coinbaseadvanced`) may not exist, so resolve defensively
-    # with getattr instead of attribute access that would raise AttributeError.
-    if use_sandbox:
-        preferred_exchange_ids = ["coinbaseexchange", "coinbase", "coinbaseadvanced"]
-    else:
-        preferred_exchange_ids = ["coinbase", "coinbaseadvanced", "coinbaseexchange"]
-
-    ExchangeClass = None
-    exchange_id = None
-    for candidate_id in preferred_exchange_ids:
-        ExchangeClass = getattr(ccxt, candidate_id, None)
-        if ExchangeClass is not None:
-            exchange_id = candidate_id
-            break
-    if ExchangeClass is None:
-        raise AttributeError(
-            "No Coinbase exchange class found in ccxt. Update ccxt: pip install -U ccxt"
-        )
+    ExchangeClass, exchange_id = resolve_coinbase_exchange_class(use_sandbox)
 
     exchange_config = {
         "apiKey": api_key,
