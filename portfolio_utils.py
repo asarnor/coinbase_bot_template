@@ -5,8 +5,9 @@ Helpers for Coinbase portfolio valuation and symbol market snapshots.
 import os
 from typing import Dict, List, Optional
 
-import ccxt
 from dotenv import load_dotenv
+
+from coinbase_exchange import resolve_coinbase_exchange_class
 
 
 def load_exchange_from_env(use_sandbox: bool = False):
@@ -23,22 +24,7 @@ def load_exchange_from_env(use_sandbox: bool = False):
     if api_secret and "\\n" in api_secret:
         api_secret = api_secret.replace("\\n", "\n")
 
-    # Coinbase Advanced Trade is `ccxt.coinbase` in current ccxt; resolve defensively
-    # so a missing alias (e.g. coinbaseadvanced) does not raise AttributeError.
-    if use_sandbox:
-        preferred_exchange_ids = ["coinbaseexchange", "coinbase", "coinbaseadvanced"]
-    else:
-        preferred_exchange_ids = ["coinbase", "coinbaseadvanced", "coinbaseexchange"]
-
-    exchange_class = None
-    for candidate_id in preferred_exchange_ids:
-        exchange_class = getattr(ccxt, candidate_id, None)
-        if exchange_class is not None:
-            break
-    if exchange_class is None:
-        raise AttributeError(
-            "No Coinbase exchange class found in ccxt. Update ccxt: pip install -U ccxt"
-        )
+    exchange_class, _ = resolve_coinbase_exchange_class(use_sandbox)
 
     config = {
         "apiKey": api_key,
