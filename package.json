@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node main.js",
     "test": "node main.js --test",
+    "test:unit": "node --test test_coinbase_exchange.js",
     "sandbox": "node main.js --sandbox",
     "execute": "node main.js --execute"
   },
