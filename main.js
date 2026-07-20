@@ -4,6 +4,7 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import dotenv from 'dotenv';
 import { existsSync } from 'fs';
+import { resolveCoinbaseExchange } from './coinbase_exchange.js';
 
 // Load base .env file first (for shared config)
 dotenv.config();
@@ -79,8 +80,9 @@ if (hasPlaceholderKeys) {
     console.log("   Tests that require authentication will fail.\n");
 }
 
-// Get the exchange class - Use coinbaseexchange for sandbox support, coinbaseadvanced for production
-const ExchangeClass = useSandbox ? (ccxt.coinbaseexchange || ccxt.coinbaseadvanced) : (ccxt.coinbaseadvanced || ccxt.coinbaseexchange);
+// Current ccxt exposes Advanced Trade as `coinbase`; resolve older aliases
+// defensively while keeping sandbox restricted to the Exchange test endpoint.
+const { ExchangeClass, exchangeId } = resolveCoinbaseExchange(ccxt, useSandbox);
 
 if (argv.test) {
     console.log("🧪 TEST MODE ENABLED");
@@ -92,7 +94,7 @@ let exchange;
 try {
     // Build exchange config
     // Note: Sandbox (coinbaseexchange) requires password field even if empty
-    // Production (coinbaseadvanced) doesn't require it for Advanced Trade API
+    // Production Advanced Trade doesn't require it.
     const exchangeConfig = {
         apiKey: apiKey,
         secret: apiSecret,
@@ -107,7 +109,9 @@ try {
     exchange = new ExchangeClass(exchangeConfig);
     
     // Check connection
-    console.log(`🔌 Connecting to ${useSandbox ? 'SANDBOX' : 'PRODUCTION'}...`);
+    console.log(
+        `🔌 Connecting to ${useSandbox ? 'SANDBOX' : 'PRODUCTION'} via ccxt.${exchangeId}...`
+    );
     await exchange.loadMarkets();
     console.log("✅ Connected to Coinbase Advanced Trade successfully.");
     
