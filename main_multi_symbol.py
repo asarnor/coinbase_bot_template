@@ -60,6 +60,10 @@ def reset_position_state(position: Dict, record_exit: bool = False) -> None:
     position["reconciled_from_balance"] = False
     position["pending_order_id"] = None
     position["pending_order_side"] = None
+    position["pending_entry_signal"] = None
+    position["pending_order_amount"] = 0.0
+    position["pending_order_price"] = 0.0
+    position["needs_entry_finalize"] = False
 
 
 def fetch_data(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
@@ -339,31 +343,46 @@ def place_exit_order(
         return False, None
 
 
-def sync_pending_order(exchange, symbol: str, base_currency: str, pos: Dict, journal) -> None:
+def sync_pending_order(
+    exchange,
+    symbol: str,
+    base_currency: str,
+    pos: Dict,
+    journal,
+    daily_state: Optional[Dict] = None,
+) -> str:
     """Resolve or cancel a limit order left resting from a previous cycle.
+
+    Returns one of:
+      - "none": no pending order
+      - "still_pending": order still open/unknown; caller MUST skip new orders
+      - "buy_filled": late buy fill applied (risk state updated)
+      - "sell_filled": late sell fill applied (P&L recorded, position reset)
+      - "cancelled": stale order cancelled (or cleared after terminal status)
+      - "partial_buy": cancelled buy that had already partially filled
 
     Without this, an unfilled limit entry/exit is silently abandoned: the order
     keeps sitting on the book while the bot's state machine moves on, and the next
-    cycle can place *another* order for the same symbol on top of it. This runs at
-    the top of every cycle for every symbol with a tracked pending order and either
-    (a) picks up a fill that completed after the initial wait, (b) cancels a stale
-    order that never filled, or (c) clears tracking for any other terminal status.
+    cycle can place *another* order for the same symbol on top of it.
     """
     order_id = pos.get("pending_order_id")
     if not order_id:
-        return
+        return "none"
 
     side = pos.get("pending_order_side")
     try:
         order = exchange.fetch_order(order_id, symbol)
     except Exception as exc:
         print(f"[{base_currency}] ⚠️  Could not check pending {side} order {order_id}: {exc}")
-        return
+        # Keep tracking and block new orders so we never stack on a live resting order.
+        return "still_pending"
 
     status = order.get("status")
 
     if status == "closed":
-        filled, average = extract_fill(order, pos.get("position_amount", 0.0), pos.get("entry_price", 0.0))
+        fallback_amount = pos.get("position_amount", 0.0) or pos.get("pending_order_amount", 0.0)
+        fallback_price = pos.get("entry_price", 0.0) or pos.get("pending_order_price", 0.0)
+        filled, average = extract_fill(order, fallback_amount, fallback_price)
         print(
             f"[{base_currency}] ✅ Pending {side} order {order_id} had filled: "
             f"{filled:.6f} @ {format_price(average)}"
@@ -382,34 +401,115 @@ def sync_pending_order(exchange, symbol: str, base_currency: str, pos: Dict, jou
             pos["entry_price"] = average
             pos["peak_price"] = average
             pos["in_position"] = True
-        else:
-            reset_position_state(pos, record_exit=True)
-        pos["pending_order_id"] = None
-        pos["pending_order_side"] = None
-        return
+            pos["breakeven_set"] = False
+            pos["needs_entry_finalize"] = True
+            signal = pos.get("pending_entry_signal")
+            if daily_state is not None:
+                record_trade(daily_state, symbol, signal=signal)
+            journal.log_event(
+                "entry_executed",
+                symbol=symbol,
+                side="buy",
+                status="executed",
+                price=average,
+                amount=filled,
+                cost_usd=average * filled if average and filled else None,
+                order_id=order_id,
+                payload={
+                    "source": "pending_limit_fill",
+                    "rsi": (signal or {}).get("rsi"),
+                    "trend_strength": (signal or {}).get("trend_strength"),
+                    "volume_ratio": (signal or {}).get("volume_ratio"),
+                },
+            )
+            pos["pending_order_id"] = None
+            pos["pending_order_side"] = None
+            pos["pending_entry_signal"] = None
+            pos["pending_order_amount"] = 0.0
+            pos["pending_order_price"] = 0.0
+            return "buy_filled"
+
+        entry_price = pos.get("entry_price", 0.0) or 0.0
+        amount = pos.get("position_amount", 0.0) or filled
+        pnl = (average - entry_price) * amount if entry_price and amount else 0.0
+        profit_pct = (average - entry_price) / entry_price if entry_price else 0.0
+        if daily_state is not None:
+            record_realized_pnl(daily_state, symbol, pnl)
+        journal.log_event(
+            "exit_executed",
+            symbol=symbol,
+            side="sell",
+            reason="pending_limit_fill",
+            status="executed",
+            price=average,
+            amount=amount,
+            cost_usd=average * amount if average and amount else None,
+            profit_pct=profit_pct,
+            order_id=order_id,
+            payload={"estimated_pnl_usd": pnl, "source": "pending_limit_fill"},
+        )
+        reset_position_state(pos, record_exit=True)
+        return "sell_filled"
 
     if status == "open":
+        # Capture any partial fill before cancelling so we do not invent a fresh
+        # entry on top of residual inventory.
+        try:
+            partial_filled = float(order.get("filled") or 0)
+        except (TypeError, ValueError):
+            partial_filled = 0.0
+        try:
+            partial_avg = float(order.get("average") or order.get("price") or 0)
+        except (TypeError, ValueError):
+            partial_avg = 0.0
+
         try:
             exchange.cancel_order(order_id, symbol)
-            print(f"[{base_currency}] 🧹 Cancelled stale {side} limit order {order_id} (never filled)")
+            print(f"[{base_currency}] 🧹 Cancelled stale {side} limit order {order_id}")
             journal.log_event(
                 "pending_order_cancelled",
                 symbol=symbol,
                 side=side,
                 status="cancelled",
                 order_id=order_id,
+                amount=partial_filled if partial_filled > 0 else None,
+                price=partial_avg if partial_avg > 0 else None,
             )
         except Exception as exc:
             print(f"[{base_currency}] ⚠️  Could not cancel stale {side} order {order_id}: {exc}")
             # Leave it tracked so we try again next cycle rather than losing the id.
-            return
+            return "still_pending"
+
         pos["pending_order_id"] = None
         pos["pending_order_side"] = None
-        return
+        pos["pending_entry_signal"] = None
+        pos["pending_order_amount"] = 0.0
+        pos["pending_order_price"] = 0.0
+
+        if side == "buy" and partial_filled > 0:
+            pos["position_amount"] = partial_filled
+            pos["entry_price"] = partial_avg if partial_avg > 0 else pos.get("entry_price", 0.0)
+            pos["peak_price"] = pos["entry_price"]
+            pos["in_position"] = True
+            pos["breakeven_set"] = False
+            pos["needs_entry_finalize"] = True
+            if daily_state is not None:
+                record_trade(daily_state, symbol, signal=None)
+            print(
+                f"[{base_currency}] ⚠️  Cancelled buy had partial fill "
+                f"{partial_filled:.6f}; tracking as open position."
+            )
+            return "partial_buy"
+
+        return "cancelled"
 
     # canceled / rejected / expired / unknown -- stop tracking, nothing left to reconcile.
     pos["pending_order_id"] = None
     pos["pending_order_side"] = None
+    pos["pending_entry_signal"] = None
+    pos["pending_order_amount"] = 0.0
+    pos["pending_order_price"] = 0.0
+    return "cancelled"
 
 
 def get_regime_state(
@@ -761,6 +861,10 @@ for symbol in symbols:
         "reconciled_from_balance": False,
         "pending_order_id": None,
         "pending_order_side": None,
+        "pending_entry_signal": None,
+        "pending_order_amount": 0.0,
+        "pending_order_price": 0.0,
+        "needs_entry_finalize": False,
     }
 
 if reconcile_on_start:
@@ -930,7 +1034,16 @@ while True:
         try:
             base_currency = symbol.split("/")[0]
             pos = positions[symbol]
-            sync_pending_order(exchange, symbol, base_currency, pos, journal)
+            sync_status = sync_pending_order(
+                exchange, symbol, base_currency, pos, journal, daily_state=daily_state
+            )
+            # Never place new orders while a previous limit is still tracked.
+            if sync_status == "still_pending" or pos.get("pending_order_id"):
+                print(
+                    f"[{base_currency}] ⏳ Waiting on pending {pos.get('pending_order_side')} "
+                    f"order {pos.get('pending_order_id')}; skipping new trades this cycle."
+                )
+                continue
 
             df = fetch_data(exchange, symbol, timeframe)
             if df.empty or len(df) < 30:
@@ -974,6 +1087,19 @@ while True:
                 dynamic_profit_target *= profile["high_volatility_profit_target_scale"]
                 dynamic_spike_reversal *= profile["high_volatility_spike_scale"]
                 dynamic_atr_multiplier *= profile["high_volatility_atr_scale"]
+
+            # Late limit-buy fills (and partial fills after cancel) need stop/target
+            # initialized from the current candle's ATR once indicators are available.
+            if pos.get("needs_entry_finalize") and pos.get("in_position") and pos.get("entry_price"):
+                entry_px = pos["entry_price"]
+                pos["trailing_stop_price"] = entry_px - (atr * dynamic_atr_multiplier)
+                pos["trailing_profit_target"] = entry_px * (1 + dynamic_profit_target)
+                pos["needs_entry_finalize"] = False
+                print(
+                    f"[{base_currency}] 🔧 Finalized late-fill entry: stop="
+                    f"{format_price(pos['trailing_stop_price'])} target="
+                    f"{format_price(pos['trailing_profit_target'])}"
+                )
 
             print(
                 f"[{base_currency}] Price: {format_price(price)} | RSI: {rsi:.2f} | "
@@ -1159,6 +1285,9 @@ while True:
                         if pending_order_id:
                             pos["pending_order_id"] = pending_order_id
                             pos["pending_order_side"] = "buy"
+                            pos["pending_entry_signal"] = current_signal
+                            pos["pending_order_amount"] = amount
+                            pos["pending_order_price"] = price
                         journal.log_event(
                             "entry_unfilled_or_failed",
                             symbol=symbol,
@@ -1171,6 +1300,7 @@ while True:
                             cost_usd=cost,
                             order_id=pending_order_id,
                         )
+                        continue
 
             else:
                 # Entries above use the last CLOSED candle to avoid repainting, but
@@ -1268,6 +1398,8 @@ while True:
                         profit_pct=profit_pct,
                         order_id=pending_order_id,
                     )
+                    if pending_order_id:
+                        continue
 
                 profit_target_price = entry_price * (1 + dynamic_profit_target)
                 if price >= profit_target_price:
@@ -1323,6 +1455,8 @@ while True:
                         profit_pct=profit_pct,
                         order_id=pending_order_id,
                     )
+                    if pending_order_id:
+                        continue
 
                 if pos["trailing_profit_target"] > 0 and price >= pos["trailing_profit_target"]:
                     print(
@@ -1377,6 +1511,8 @@ while True:
                         profit_pct=profit_pct,
                         order_id=pending_order_id,
                     )
+                    if pending_order_id:
+                        continue
 
                 potential_stop = price - (atr * dynamic_atr_multiplier)
                 if potential_stop > pos["trailing_stop_price"]:
