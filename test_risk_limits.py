@@ -17,6 +17,7 @@ from risk_limits import (
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    restore_pending_orders_from_events,
     setup_is_stronger,
     symbol_loss_limit_hit,
     symbol_realized_pnl,
@@ -378,6 +379,200 @@ class RebuildDailyStateFromEventsTests(unittest.TestCase):
         events = [{"event_type": "exit_executed", "symbol": "BTC/USD", "payload_json": "{not-json"}]
         state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
         self.assertAlmostEqual(symbol_realized_pnl(state, "BTC/USD"), 0.0)
+
+
+def empty_position():
+    return {
+        "in_position": False,
+        "pending_order_id": None,
+        "pending_order_side": None,
+        "pending_entry_signal": None,
+        "pending_order_amount": 0.0,
+        "pending_order_price": 0.0,
+    }
+
+
+class RestorePendingOrdersFromEventsTests(unittest.TestCase):
+    def test_restores_unresolved_entry_limit(self):
+        positions = {"BTC/USD": empty_position(), "ETH/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "ord-btc-1",
+                "amount": 0.01,
+                "price": 100000.0,
+                "payload_json": json.dumps(
+                    {"signal": {"rsi": 60.0, "trend_strength": 0.02, "volume_ratio": 1.5}}
+                ),
+            }
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(set(restored), {"BTC/USD"})
+        self.assertEqual(positions["BTC/USD"]["pending_order_id"], "ord-btc-1")
+        self.assertEqual(positions["BTC/USD"]["pending_order_side"], "buy")
+        self.assertEqual(positions["BTC/USD"]["pending_order_amount"], 0.01)
+        self.assertEqual(positions["BTC/USD"]["pending_entry_signal"]["rsi"], 60.0)
+        self.assertIsNone(positions["ETH/USD"]["pending_order_id"])
+
+    def test_clears_pending_after_cancel(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "ord-1",
+                "amount": 0.01,
+                "price": 100.0,
+            },
+            {
+                "event_type": "pending_order_cancelled",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "ord-1",
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored, {})
+        self.assertIsNone(positions["BTC/USD"]["pending_order_id"])
+
+    def test_clears_pending_after_late_fill(self):
+        positions = {"ETH/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "ETH/USD",
+                "side": "buy",
+                "order_id": "ord-eth",
+                "amount": 1.0,
+                "price": 3000.0,
+            },
+            {
+                "event_type": "pending_buy_order_filled",
+                "symbol": "ETH/USD",
+                "side": "buy",
+                "order_id": "ord-eth",
+            },
+            {
+                "event_type": "entry_executed",
+                "symbol": "ETH/USD",
+                "side": "buy",
+                "order_id": "ord-eth",
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored, {})
+        self.assertIsNone(positions["ETH/USD"]["pending_order_id"])
+
+    def test_does_not_clear_when_unrelated_order_id_fills(self):
+        # A fill for a different order must not drop tracking of the still-resting
+        # limit -- that would recreate the overlapping-order bug after restart.
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "resting-limit",
+                "amount": 0.01,
+                "price": 100.0,
+            },
+            {
+                "event_type": "entry_executed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "some-other-order",
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored["BTC/USD"]["order_id"], "resting-limit")
+        self.assertEqual(positions["BTC/USD"]["pending_order_id"], "resting-limit")
+
+    def test_restores_unresolved_exit_limit(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "exit_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "sell",
+                "order_id": "sell-1",
+                "amount": 0.5,
+                "price": 110000.0,
+            }
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored["BTC/USD"]["side"], "sell")
+        self.assertEqual(positions["BTC/USD"]["pending_order_id"], "sell-1")
+        self.assertEqual(positions["BTC/USD"]["pending_order_side"], "sell")
+
+    def test_ignores_unfilled_events_without_order_id(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": None,
+                "amount": 0.01,
+                "price": 100.0,
+            }
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored, {})
+        self.assertIsNone(positions["BTC/USD"]["pending_order_id"])
+
+    def test_keeps_latest_unresolved_pending_per_symbol(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "old-order",
+                "amount": 0.01,
+                "price": 90.0,
+            },
+            {
+                "event_type": "pending_order_cancelled",
+                "symbol": "BTC/USD",
+                "order_id": "old-order",
+            },
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "new-order",
+                "amount": 0.02,
+                "price": 95.0,
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored["BTC/USD"]["order_id"], "new-order")
+        self.assertEqual(positions["BTC/USD"]["pending_order_amount"], 0.02)
+
+    def test_market_entry_without_order_id_clears_matching_buy_pending(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "limit-1",
+                "amount": 0.01,
+                "price": 100.0,
+            },
+            {
+                "event_type": "entry_executed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": None,
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored, {})
+        self.assertIsNone(positions["BTC/USD"]["pending_order_id"])
 
 
 class ValidateSymbolConfigurationTests(unittest.TestCase):

@@ -232,6 +232,7 @@ For persistent storage, provide `DATABASE_URL` and the bot will automatically sw
 - skipped entries
 - executed entries and exits
 - pending limit orders that later filled or were cancelled as stale
+- resting limit order IDs restored from the journal after a restart (so a redeploy does not forget open limits and place overlapping orders)
 - daily risk state restored from the journal after a restart
 - warnings and runtime errors
 - portfolio snapshots

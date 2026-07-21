@@ -7,6 +7,7 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import ccxt
@@ -25,6 +26,7 @@ from risk_limits import (
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    restore_pending_orders_from_events,
     symbol_loss_limit_hit,
     validate_symbol_configuration,
 )
@@ -360,6 +362,8 @@ def sync_pending_order(
       - "sell_filled": late sell fill applied (P&L recorded, position reset)
       - "cancelled": stale order cancelled (or cleared after terminal status)
       - "partial_buy": cancelled buy that had already partially filled
+      - "partial_sell": cancelled sell that had already partially filled
+        (position_amount reduced / P&L recorded; fully closed if nothing remains)
 
     Without this, an unfilled limit entry/exit is silently abandoned: the order
     keeps sitting on the book while the bot's state machine moves on, and the next
@@ -480,6 +484,12 @@ def sync_pending_order(
             # Leave it tracked so we try again next cycle rather than losing the id.
             return "still_pending"
 
+        # Capture before clearing so a partial-fill entry can still journal the
+        # original signal (rebuild_daily_state_from_events reads it from entry_executed).
+        signal = pos.get("pending_entry_signal")
+        original_entry_price = pos.get("entry_price", 0.0) or 0.0
+        buy_entry_price = partial_avg if partial_avg > 0 else original_entry_price
+
         pos["pending_order_id"] = None
         pos["pending_order_side"] = None
         pos["pending_entry_signal"] = None
@@ -488,18 +498,94 @@ def sync_pending_order(
 
         if side == "buy" and partial_filled > 0:
             pos["position_amount"] = partial_filled
-            pos["entry_price"] = partial_avg if partial_avg > 0 else pos.get("entry_price", 0.0)
+            pos["entry_price"] = buy_entry_price
             pos["peak_price"] = pos["entry_price"]
             pos["in_position"] = True
             pos["breakeven_set"] = False
             pos["needs_entry_finalize"] = True
             if daily_state is not None:
-                record_trade(daily_state, symbol, signal=None)
+                record_trade(daily_state, symbol, signal=signal)
+            # Must journal entry_executed so a mid-day restart can rebuild trade
+            # counts / last-signal state from the event stream (record_trade alone
+            # only updates in-memory daily_state).
+            journal.log_event(
+                "entry_executed",
+                symbol=symbol,
+                side="buy",
+                status="executed",
+                price=buy_entry_price if buy_entry_price else None,
+                amount=partial_filled,
+                cost_usd=(
+                    buy_entry_price * partial_filled
+                    if buy_entry_price and partial_filled
+                    else None
+                ),
+                order_id=order_id,
+                payload={
+                    "source": "pending_limit_partial_fill",
+                    "rsi": (signal or {}).get("rsi"),
+                    "trend_strength": (signal or {}).get("trend_strength"),
+                    "volume_ratio": (signal or {}).get("volume_ratio"),
+                },
+            )
             print(
                 f"[{base_currency}] ⚠️  Cancelled buy had partial fill "
                 f"{partial_filled:.6f}; tracking as open position."
             )
             return "partial_buy"
+
+        if side == "sell" and partial_filled > 0:
+            # Shrink tracked inventory to match what is left on the exchange after
+            # the partial exit; otherwise later sells / P&L / risk tallies stay
+            # sized to the pre-cancel amount.
+            tracked_amount = pos.get("position_amount", 0.0) or 0.0
+            sold_amount = min(partial_filled, tracked_amount) if tracked_amount > 0 else partial_filled
+            remaining = max(0.0, tracked_amount - sold_amount)
+            sell_price = partial_avg if partial_avg > 0 else original_entry_price
+            pnl = (
+                (sell_price - original_entry_price) * sold_amount
+                if original_entry_price and sold_amount
+                else 0.0
+            )
+            profit_pct = (
+                (sell_price - original_entry_price) / original_entry_price
+                if original_entry_price
+                else 0.0
+            )
+            if daily_state is not None:
+                record_realized_pnl(daily_state, symbol, pnl)
+            journal.log_event(
+                "exit_executed",
+                symbol=symbol,
+                side="sell",
+                reason="pending_limit_partial_fill",
+                status="executed",
+                price=sell_price if sell_price else None,
+                amount=sold_amount,
+                cost_usd=(
+                    sell_price * sold_amount if sell_price and sold_amount else None
+                ),
+                profit_pct=profit_pct,
+                order_id=order_id,
+                payload={
+                    "estimated_pnl_usd": pnl,
+                    "source": "pending_limit_partial_fill",
+                    "remaining_amount": remaining,
+                },
+            )
+            if remaining <= 0:
+                reset_position_state(pos, record_exit=True)
+                print(
+                    f"[{base_currency}] ⚠️  Cancelled sell had partial fill "
+                    f"{sold_amount:.6f}; position fully closed."
+                )
+            else:
+                pos["position_amount"] = remaining
+                print(
+                    f"[{base_currency}] ⚠️  Cancelled sell had partial fill "
+                    f"{sold_amount:.6f}; remaining position {remaining:.6f}."
+                )
+            return "partial_sell"
 
         return "cancelled"
 
@@ -931,18 +1017,34 @@ journal.log_event(
 
 today = current_day_key()
 day_start_iso = f"{today}T00:00:00+00:00"
+# Pending limits can outlive a UTC day boundary (and a crash that lasts hours),
+# so pending-order restore looks back further than the daily risk-state window.
+pending_order_lookback_days = int(os.getenv("TRADING_PENDING_ORDER_LOOKBACK_DAYS", "7"))
+pending_lookback_iso = (
+    datetime.now(timezone.utc) - timedelta(days=max(pending_order_lookback_days, 1))
+).isoformat()
 
 # Look for today's earliest portfolio snapshot and events *before* touching the
 # journal further below, so a restart mid-day can recover the day's actual
 # starting equity and risk counters instead of quietly starting over at zero.
 day_start_equity_usd = None
 todays_events: List[Dict] = []
+pending_order_events: List[Dict] = []
 if journal.enabled:
     try:
         earliest_snapshot_today = journal.get_first_snapshot_after(day_start_iso)
         if earliest_snapshot_today:
             day_start_equity_usd = earliest_snapshot_today.get("total_estimated_usd")
-        todays_events = journal.get_events_between(day_start_iso, utc_now_iso())
+        # One query covers both: filter to today for daily risk rebuild, keep the
+        # full lookback for unresolved resting limit orders.
+        pending_order_events = journal.get_events_between(
+            pending_lookback_iso, utc_now_iso()
+        )
+        todays_events = [
+            event
+            for event in pending_order_events
+            if (event.get("created_at") or "") >= day_start_iso
+        ]
     except Exception as exc:
         journal.log_event(
             "warning",
@@ -994,6 +1096,26 @@ if todays_events:
     )
 else:
     daily_state = new_daily_state(today, day_start_equity_usd)
+
+# Re-attach any resting limit orders the previous process left on the book.
+# Without this, pending_order_id resets to None on every boot and the next cycle
+# can place a second overlapping order while the first is still open.
+if pending_order_events:
+    restored_pending = restore_pending_orders_from_events(positions, pending_order_events)
+    if restored_pending:
+        print(
+            f"♻️  Restored {len(restored_pending)} resting limit order(s) from the journal:"
+        )
+        for symbol, info in restored_pending.items():
+            print(
+                f"   {symbol}: {info['side']} order {info['order_id']} "
+                f"(amount={info['amount']}, price={info['price']})"
+            )
+        journal.log_event(
+            "pending_orders_restored",
+            status="restored",
+            payload={"orders": restored_pending},
+        )
 
 last_regime_label = None
 last_snapshot_time = time.time()
@@ -1299,6 +1421,11 @@ while True:
                             amount=amount,
                             cost_usd=cost,
                             order_id=pending_order_id,
+                            # Persist the signal so a restart can rebuild
+                            # pending_entry_signal for late-fill risk accounting.
+                            payload={
+                                "signal": current_signal if pending_order_id else None,
+                            },
                         )
                         continue
 

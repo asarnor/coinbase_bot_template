@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pure, testable helpers for position sizing, order fills, per-coin daily risk
-limits, restart-safe state recovery, and startup config validation.
+limits, restart-safe state recovery (daily risk counters and resting limit
+orders), and startup config validation.
 
 These functions intentionally have no side effects and never touch the exchange or
 network, so they can be imported and unit-tested in isolation. The trading bot
@@ -185,6 +186,128 @@ def _decode_event_payload(event: Dict) -> Dict[str, Any]:
         return decoded if isinstance(decoded, dict) else {}
     except (TypeError, ValueError):
         return {}
+
+
+def restore_pending_orders_from_events(
+    positions: Dict[str, Dict],
+    events: List[Dict],
+) -> Dict[str, Dict]:
+    """Replay journal events to recover resting limit-order IDs after a restart.
+
+    Pending limit orders are tracked in process memory (`pending_order_id` on each
+    position). A redeploy / crash clears that state while the order can still rest
+    on the exchange, so the next cycle may place a second overlapping order for the
+    same symbol. The journal already records `order_id` on
+    `entry_unfilled_or_failed` / `exit_unfilled_or_failed` and on the resolve events
+    (`pending_order_cancelled`, `pending_*_order_filled`, and matching
+    `entry_executed` / `exit_executed`). Replaying those chronologically restores
+    whichever order is still unresolved per symbol so `sync_pending_order` can
+    cancel or apply the fill instead of abandoning it.
+
+    Returns a dict of symbol -> restored pending summary (for startup logging).
+    Mutates `positions` in place.
+    """
+    # Working copy while replaying; only applied to `positions` at the end so a
+    # mid-replay clear does not leave a half-applied id on a live position dict.
+    pending_by_symbol: Dict[str, Optional[Dict]] = {symbol: None for symbol in positions}
+
+    open_event_types = {"entry_unfilled_or_failed", "exit_unfilled_or_failed"}
+    clear_event_types = {
+        "pending_order_cancelled",
+        "pending_buy_order_filled",
+        "pending_sell_order_filled",
+        "entry_executed",
+        "exit_executed",
+    }
+
+    for event in events:
+        symbol = event.get("symbol")
+        if not symbol or symbol not in pending_by_symbol:
+            continue
+
+        event_type = event.get("event_type")
+        order_id = event.get("order_id") or None
+        current = pending_by_symbol[symbol]
+
+        if event_type in open_event_types and order_id:
+            side = event.get("side")
+            if not side:
+                side = "buy" if event_type.startswith("entry_") else "sell"
+            try:
+                amount = float(event.get("amount") or 0.0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            try:
+                price = float(event.get("price") or 0.0)
+            except (TypeError, ValueError):
+                price = 0.0
+
+            payload = _decode_event_payload(event)
+            signal = None
+            if side == "buy":
+                # Prefer an explicit nested signal dict; fall back to flat payload
+                # keys written by older journal rows.
+                nested = payload.get("signal")
+                if isinstance(nested, dict):
+                    signal = {
+                        "rsi": nested.get("rsi"),
+                        "trend_strength": nested.get("trend_strength"),
+                        "volume_ratio": nested.get("volume_ratio"),
+                    }
+                elif any(k in payload for k in ("rsi", "trend_strength", "volume_ratio")):
+                    signal = {
+                        "rsi": payload.get("rsi"),
+                        "trend_strength": payload.get("trend_strength"),
+                        "volume_ratio": payload.get("volume_ratio"),
+                    }
+
+            pending_by_symbol[symbol] = {
+                "pending_order_id": str(order_id),
+                "pending_order_side": side,
+                "pending_order_amount": amount,
+                "pending_order_price": price,
+                "pending_entry_signal": signal,
+            }
+            continue
+
+        if event_type not in clear_event_types or current is None:
+            continue
+
+        tracked_id = current.get("pending_order_id")
+        tracked_side = current.get("pending_order_side")
+
+        if order_id and str(order_id) != str(tracked_id):
+            # A fill/cancel for a *different* order must not drop tracking of the
+            # still-resting limit -- that is exactly the overlapping-order bug.
+            continue
+
+        if not order_id and event_type in ("entry_executed", "exit_executed"):
+            # Market (or otherwise untagged) fill for this symbol: only clear when
+            # the side matches, so a buy fill does not erase a resting sell limit.
+            if event_type == "entry_executed" and tracked_side != "buy":
+                continue
+            if event_type == "exit_executed" and tracked_side != "sell":
+                continue
+
+        pending_by_symbol[symbol] = None
+
+    restored: Dict[str, Dict] = {}
+    for symbol, pending in pending_by_symbol.items():
+        if not pending:
+            continue
+        pos = positions[symbol]
+        pos["pending_order_id"] = pending["pending_order_id"]
+        pos["pending_order_side"] = pending["pending_order_side"]
+        pos["pending_order_amount"] = pending["pending_order_amount"]
+        pos["pending_order_price"] = pending["pending_order_price"]
+        pos["pending_entry_signal"] = pending["pending_entry_signal"]
+        restored[symbol] = {
+            "order_id": pending["pending_order_id"],
+            "side": pending["pending_order_side"],
+            "amount": pending["pending_order_amount"],
+            "price": pending["pending_order_price"],
+        }
+    return restored
 
 
 def rebuild_daily_state_from_events(
