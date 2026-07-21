@@ -371,6 +371,22 @@ def get_position_size(current_price):
         print(f"Balance Error: {e}")
         return 0, 0
 
+
+def place_exit_order(exchange, symbol, amount, enable_trading):
+    """Return True only when the stop-loss sell was submitted successfully."""
+    if not enable_trading:
+        print(f"   (Simulated - use --execute to enable real trading)")
+        return True
+
+    try:
+        order = exchange.create_market_sell_order(symbol, amount)
+        print(f"✅ Sell order executed: {order.get('id', 'N/A')}")
+        return True
+    except Exception as e:
+        print(f"❌ Sell order failed: {e}")
+        return False
+
+
 # --- MAIN LOOP ---
 while True:
     df = fetch_data()
@@ -425,18 +441,12 @@ while True:
             # Crash Protection Trigger
             if price <= trailing_stop_price:
                 print(f"🚨 STOP LOSS TRIGGERED at ${price:.2f}")
-                
-                if enable_trading:
-                    try:
-                        order = exchange.create_market_sell_order(symbol, position_amount)
-                        print(f"✅ Sell order executed: {order.get('id', 'N/A')}")
-                    except Exception as e:
-                        print(f"❌ Sell order failed: {e}")
+
+                if place_exit_order(exchange, symbol, position_amount, enable_trading):
+                    in_position = False
+                    trailing_stop_price = 0.0
+                    position_amount = 0.0
                 else:
-                    print(f"   (Simulated - use --execute to enable real trading)")
-                
-                in_position = False
-                trailing_stop_price = 0.0
-                position_amount = 0.0
+                    print("⚠️  Position remains open; stop-loss sell will be retried.")
 
     time.sleep(check_interval)  # Check every N seconds (configurable via TRADING_CHECK_INTERVAL)
