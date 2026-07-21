@@ -3,6 +3,7 @@
 
 Run with:  python -m unittest test_risk_limits    (no extra dependencies required)
 """
+import json
 import unittest
 from datetime import datetime, timezone
 
@@ -12,6 +13,7 @@ from risk_limits import (
     evaluate_entry_limits,
     extract_fill,
     new_daily_state,
+    rebuild_daily_state_from_events,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
@@ -19,6 +21,7 @@ from risk_limits import (
     symbol_loss_limit_hit,
     symbol_realized_pnl,
     symbol_trade_count,
+    validate_symbol_configuration,
 )
 
 
@@ -288,6 +291,129 @@ class StrongerSetupTests(unittest.TestCase):
 def price_for(cost, amount):
     """Helper: recover the implied price so we can assert amount * price == cost."""
     return cost / amount if amount else 0.0
+
+
+def entry_event(symbol, rsi=60.0, trend_strength=0.02, volume_ratio=1.5, created_at="2026-07-03T10:00:00+00:00"):
+    return {
+        "event_type": "entry_executed",
+        "symbol": symbol,
+        "created_at": created_at,
+        "payload_json": json.dumps(
+            {"rsi": rsi, "trend_strength": trend_strength, "volume_ratio": volume_ratio}
+        ),
+    }
+
+
+def exit_event(symbol, pnl_usd, created_at="2026-07-03T11:00:00+00:00"):
+    return {
+        "event_type": "exit_executed",
+        "symbol": symbol,
+        "created_at": created_at,
+        "payload_json": json.dumps({"estimated_pnl_usd": pnl_usd}),
+    }
+
+
+def halt_event(symbol, created_at="2026-07-03T12:00:00+00:00"):
+    return {"event_type": "daily_loss_limit_triggered", "symbol": symbol, "created_at": created_at}
+
+
+class RebuildDailyStateFromEventsTests(unittest.TestCase):
+    def test_empty_events_matches_new_daily_state(self):
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, [])
+        self.assertEqual(state["trades"], 0)
+        self.assertEqual(state["symbol_trades"], {})
+        self.assertAlmostEqual(state["start_equity_usd"], 1000.0)
+
+    def test_replays_entries_and_exits_per_coin(self):
+        events = [
+            entry_event("BTC/USD"),
+            entry_event("BTC/USD"),
+            entry_event("ETH/USD"),
+            exit_event("BTC/USD", -20.0),
+            exit_event("ETH/USD", 15.0),
+        ]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertEqual(state["trades"], 3)
+        self.assertEqual(symbol_trade_count(state, "BTC/USD"), 2)
+        self.assertEqual(symbol_trade_count(state, "ETH/USD"), 1)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "BTC/USD"), -20.0)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "ETH/USD"), 15.0)
+        self.assertAlmostEqual(state["realized_pnl_usd"], -5.0)
+
+    def test_replays_explicit_halt_events(self):
+        events = [entry_event("BTC/USD"), halt_event("BTC/USD")]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertTrue(state["symbol_halted"].get("BTC/USD"))
+
+    def test_restores_last_entry_signal_for_stronger_reentry_gate(self):
+        events = [entry_event("BTC/USD", rsi=60.0, trend_strength=0.02, volume_ratio=1.5)]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        # A subsequent weaker signal should now be blocked, exactly as if the entry
+        # had happened in this same process rather than before a restart.
+        self.assertFalse(
+            setup_is_stronger(state, "BTC/USD", rsi=50.0, trend_strength=0.01, volume_ratio=1.0)
+        )
+
+    def test_safety_net_halts_symbol_even_without_explicit_event(self):
+        # Loss crossed the 5% budget but the daily_loss_limit_triggered event is
+        # missing (e.g. a transient journal write failure) -- the belt-and-suspenders
+        # recompute should still catch it when a limit pct is supplied.
+        events = [exit_event("BTC/USD", -60.0)]
+        state = rebuild_daily_state_from_events(
+            "2026-07-03", 1000.0, events, daily_loss_limit_pct=0.05
+        )
+        self.assertTrue(state["symbol_halted"].get("BTC/USD"))
+
+    def test_no_safety_net_when_limit_pct_not_supplied(self):
+        events = [exit_event("BTC/USD", -60.0)]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertFalse(state["symbol_halted"].get("BTC/USD"))
+
+    def test_ignores_events_without_a_symbol(self):
+        events = [{"event_type": "bot_started", "symbol": None, "created_at": "2026-07-03T09:00:00+00:00"}]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertEqual(state["trades"], 0)
+
+    def test_malformed_payload_json_does_not_raise(self):
+        events = [{"event_type": "exit_executed", "symbol": "BTC/USD", "payload_json": "{not-json"}]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "BTC/USD"), 0.0)
+
+
+class ValidateSymbolConfigurationTests(unittest.TestCase):
+    def test_no_warnings_for_clean_configuration(self):
+        warnings = validate_symbol_configuration(
+            ["BTC/USD", "ETH/USD", "LINK/USD"],
+            {"BTC/USD", "ETH/USD"},
+            {"LINK/USD"},
+            set(),
+        )
+        self.assertEqual(warnings, [])
+
+    def test_warns_on_bucket_symbol_missing_from_trading_symbols(self):
+        warnings = validate_symbol_configuration(
+            ["BTC/USD"], {"BTC/USD", "XRP/USD"}, set(), set()
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("XRP/USD", warnings[0])
+        self.assertIn("TRADING_CORE_SYMBOLS", warnings[0])
+
+    def test_warns_on_symbol_in_multiple_buckets(self):
+        warnings = validate_symbol_configuration(
+            ["BTC/USD"], {"BTC/USD"}, {"BTC/USD"}, set()
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("BTC/USD", warnings[0])
+        self.assertIn("core", warnings[0])
+
+    def test_can_report_multiple_distinct_warnings(self):
+        warnings = validate_symbol_configuration(
+            ["BTC/USD", "ETH/USD"],
+            {"BTC/USD", "ETH/USD"},
+            {"ETH/USD", "SOL/USD"},
+            set(),
+        )
+        self.assertEqual(len(warnings), 2)
 
 
 if __name__ == "__main__":

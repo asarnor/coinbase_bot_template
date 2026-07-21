@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Pure, testable helpers for position sizing, order fills, and per-coin daily risk limits.
+"""Pure, testable helpers for position sizing, order fills, per-coin daily risk
+limits, restart-safe state recovery, and startup config validation.
 
 These functions intentionally have no side effects and never touch the exchange or
 network, so they can be imported and unit-tested in isolation. The trading bot
@@ -9,8 +10,9 @@ Daily limits are tracked PER COIN: each symbol gets its own trade counter, reali
 P&L tally, and loss-limit halt. A losing or maxed-out coin is paused for the rest of
 the UTC day while the other coins keep trading normally.
 """
+import json
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def current_day_key(now: Optional[datetime] = None) -> str:
@@ -164,6 +166,119 @@ def setup_is_stronger(
 
     average_ratio = sum(ratios) / len(ratios)
     return average_ratio >= 1.0 + min_improvement
+
+
+def _decode_event_payload(event: Dict) -> Dict[str, Any]:
+    """Best-effort decode of a journaled event's payload back into a dict.
+
+    `TradingJournal` stores payloads as a JSON string (`payload_json`); some callers
+    may also pass an already-decoded `payload` dict directly (e.g. in tests).
+    """
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    raw = event.get("payload_json")
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+        return decoded if isinstance(decoded, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def rebuild_daily_state_from_events(
+    day: str,
+    start_equity_usd: float,
+    events: List[Dict],
+    daily_loss_limit_pct: float = 0.0,
+) -> Dict:
+    """Reconstruct a day's risk-tracking state by replaying journaled events.
+
+    Without this, `daily_state` lives only in process memory: a restart (a Railway
+    redeploy, a host recycle, a transient crash) silently resets every trade count,
+    realized P&L tally, and per-coin loss halt back to zero mid-day, letting a coin
+    that already blew its daily loss budget trade again immediately. `events` should
+    be every `bot_events` row for `day` in ascending `created_at` order, as returned
+    by `TradingJournal.get_events_between`.
+
+    `daily_loss_limit_pct` is optional belt-and-suspenders: beyond replaying explicit
+    `daily_loss_limit_triggered` events, it also re-applies the halt to any coin whose
+    replayed realized loss already breaches the budget, in case that one event was
+    missed (e.g. a transient journal write failure right as the halt was recorded).
+    """
+    state = new_daily_state(day, start_equity_usd)
+
+    for event in events:
+        symbol = event.get("symbol")
+        if not symbol:
+            continue
+        event_type = event.get("event_type")
+
+        if event_type == "entry_executed":
+            payload = _decode_event_payload(event)
+            signal = {
+                "rsi": payload.get("rsi"),
+                "trend_strength": payload.get("trend_strength"),
+                "volume_ratio": payload.get("volume_ratio"),
+            }
+            record_trade(state, symbol, signal=signal)
+        elif event_type == "exit_executed":
+            payload = _decode_event_payload(event)
+            pnl = payload.get("estimated_pnl_usd")
+            if pnl is not None:
+                try:
+                    record_realized_pnl(state, symbol, float(pnl))
+                except (TypeError, ValueError):
+                    pass
+        elif event_type == "daily_loss_limit_triggered":
+            state["symbol_halted"][symbol] = True
+
+    if daily_loss_limit_pct > 0:
+        for symbol in state["symbol_realized_pnl_usd"]:
+            if symbol_loss_limit_hit(state, symbol, daily_loss_limit_pct):
+                state["symbol_halted"][symbol] = True
+
+    return state
+
+
+def validate_symbol_configuration(
+    symbols: List[str],
+    core_symbols: "set",
+    tactical_symbols: "set",
+    speculative_symbols: "set",
+) -> List[str]:
+    """Return human-readable warnings for symbol/profile misconfiguration.
+
+    Two mistakes this catches: a symbol listed in a profile bucket
+    (`TRADING_CORE_SYMBOLS` etc.) but missing from `TRADING_SYMBOLS`, so it silently
+    never trades; and a symbol listed in more than one bucket, so it silently trades
+    under whichever bucket wins the core > tactical > speculative priority order.
+    """
+    warnings: List[str] = []
+    symbol_set = set(symbols)
+    buckets = (
+        ("core", core_symbols),
+        ("tactical", tactical_symbols),
+        ("speculative", speculative_symbols),
+    )
+
+    for label, bucket in buckets:
+        for extra_symbol in sorted(bucket - symbol_set):
+            warnings.append(
+                f"{extra_symbol} is listed in TRADING_{label.upper()}_SYMBOLS but not "
+                "in TRADING_SYMBOLS, so it will never be traded."
+            )
+
+    for symbol in symbols:
+        containing = [label for label, bucket in buckets if symbol in bucket]
+        if len(containing) > 1:
+            warnings.append(
+                f"{symbol} is listed in multiple profile buckets ({', '.join(containing)}); "
+                f"it will be treated as '{containing[0]}' (core > tactical > speculative)."
+            )
+
+    return warnings
 
 
 def evaluate_entry_limits(
