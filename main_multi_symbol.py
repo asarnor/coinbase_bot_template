@@ -1159,60 +1159,123 @@ while True:
             sync_status = sync_pending_order(
                 exchange, symbol, base_currency, pos, journal, daily_state=daily_state
             )
-            # Never place new orders while a previous limit is still tracked.
-            if sync_status == "still_pending" or pos.get("pending_order_id"):
+            has_pending_order = (
+                sync_status == "still_pending" or bool(pos.get("pending_order_id"))
+            )
+            pending_side = pos.get("pending_order_side")
+            # A resting sell *is* the exit -- don't stack another. A resting buy (or
+            # any pending while flat) only blocks new entries. If we somehow still
+            # hold inventory with a non-sell pending order, fall through so stop-loss
+            # / profit checks can still run against the live price.
+            if has_pending_order and (
+                not pos.get("in_position") or pending_side == "sell"
+            ):
                 print(
-                    f"[{base_currency}] ⏳ Waiting on pending {pos.get('pending_order_side')} "
+                    f"[{base_currency}] ⏳ Waiting on pending {pending_side} "
                     f"order {pos.get('pending_order_id')}; skipping new trades this cycle."
                 )
-                continue
-
-            df = fetch_data(exchange, symbol, timeframe)
-            if df.empty or len(df) < 30:
-                continue
-
-            row = analyze_market(df)
-            price = row["close"]
-            ema_20 = row["ema_20"]
-            atr = row["atr"]
-            rsi = row["rsi"]
-            ema_slope = row.get("ema_slope", 0)
-            volume_ratio = row.get("volume_ratio", 1.0)
-
-            if pd.isna(price) or pd.isna(ema_20) or pd.isna(atr) or pd.isna(rsi):
-                # Defensive: with the len(df) >= 30 guard above this should be rare,
-                # but running exit management (stop-loss especially) against a NaN
-                # value would silently disable it rather than fail loudly, so skip
-                # the cycle for this symbol and retry next time instead.
-                journal.log_event(
-                    "warning",
-                    symbol=symbol,
-                    reason="indicator_data_incomplete",
-                    status="skipped",
-                    payload={"note": "insufficient candle history for indicators this cycle"},
-                )
-                print(f"[{base_currency}] ⚠️  Incomplete indicator data this cycle; skipping.")
                 continue
 
             profile_name = symbol_profiles[symbol]
             profile = profile_settings[profile_name]
 
-            trend_strength = abs(price - ema_20) / ema_20 if ema_20 > 0 else 0
-            atr_pct = atr / price if price > 0 else 0
+            indicators_ok = False
+            price = 0.0
+            ema_20 = float("nan")
+            atr = float("nan")
+            rsi = float("nan")
+            ema_slope = 0.0
+            volume_ratio = 1.0
+
+            df = fetch_data(exchange, symbol, timeframe)
+            if not df.empty and len(df) >= 30:
+                row = analyze_market(df)
+                price = row["close"]
+                ema_20 = row["ema_20"]
+                atr = row["atr"]
+                rsi = row["rsi"]
+                ema_slope = row.get("ema_slope", 0)
+                volume_ratio = row.get("volume_ratio", 1.0)
+                if not (
+                    pd.isna(price) or pd.isna(ema_20) or pd.isna(atr) or pd.isna(rsi)
+                ):
+                    indicators_ok = True
+
+            if not indicators_ok:
+                # Entries need indicators; open-position exits mostly need a live
+                # price against already-set stops/targets. Skipping the whole symbol
+                # here used to leave positions unmanaged for a full cycle.
+                if not pos.get("in_position"):
+                    if not df.empty and len(df) >= 30:
+                        journal.log_event(
+                            "warning",
+                            symbol=symbol,
+                            reason="indicator_data_incomplete",
+                            status="skipped",
+                            payload={
+                                "note": "insufficient candle history for indicators this cycle"
+                            },
+                        )
+                        print(
+                            f"[{base_currency}] ⚠️  Incomplete indicator data this cycle; skipping."
+                        )
+                    continue
+
+                journal.log_event(
+                    "warning",
+                    symbol=symbol,
+                    reason="indicator_data_incomplete",
+                    status="exit_only",
+                    payload={
+                        "note": (
+                            "indicators unavailable; managing open position with live "
+                            "price only (no new entries / ATR stop ratchet this cycle)"
+                        )
+                    },
+                )
+                try:
+                    live_price = exchange.fetch_ticker(symbol)["last"]
+                    if not live_price or live_price <= 0:
+                        print(
+                            f"[{base_currency}] ⚠️  Incomplete indicators and no usable "
+                            "live price; skipping."
+                        )
+                        continue
+                    price = live_price
+                except Exception as exc:
+                    print(
+                        f"[{base_currency}] ⚠️  Incomplete indicators and live price "
+                        f"fetch failed ({exc}); skipping."
+                    )
+                    continue
+                print(
+                    f"[{base_currency}] ⚠️  Incomplete indicator data; still managing "
+                    "open position exits off live price."
+                )
+
+            trend_strength = (
+                abs(price - ema_20) / ema_20 if indicators_ok and ema_20 > 0 else 0
+            )
+            atr_pct = atr / price if indicators_ok and price > 0 else 0
 
             dynamic_profit_target = profile["profit_target_pct"]
             dynamic_spike_reversal = profile["spike_reversal_pct"]
             dynamic_min_spike_profit = profile["min_spike_profit_pct"]
             dynamic_atr_multiplier = profile["atr_multiplier"]
 
-            if atr_pct >= profile["high_volatility_atr_pct"]:
+            if indicators_ok and atr_pct >= profile["high_volatility_atr_pct"]:
                 dynamic_profit_target *= profile["high_volatility_profit_target_scale"]
                 dynamic_spike_reversal *= profile["high_volatility_spike_scale"]
                 dynamic_atr_multiplier *= profile["high_volatility_atr_scale"]
 
             # Late limit-buy fills (and partial fills after cancel) need stop/target
             # initialized from the current candle's ATR once indicators are available.
-            if pos.get("needs_entry_finalize") and pos.get("in_position") and pos.get("entry_price"):
+            if (
+                indicators_ok
+                and pos.get("needs_entry_finalize")
+                and pos.get("in_position")
+                and pos.get("entry_price")
+            ):
                 entry_px = pos["entry_price"]
                 pos["trailing_stop_price"] = entry_px - (atr * dynamic_atr_multiplier)
                 pos["trailing_profit_target"] = entry_px * (1 + dynamic_profit_target)
@@ -1223,12 +1286,19 @@ while True:
                     f"{format_price(pos['trailing_profit_target'])}"
                 )
 
-            print(
-                f"[{base_currency}] Price: {format_price(price)} | RSI: {rsi:.2f} | "
-                f"Stop: {format_price(pos['trailing_stop_price'])} | "
-                f"Position: {'YES' if pos['in_position'] else 'NO'} | "
-                f"Profile: {profile_name}"
-            )
+            if indicators_ok:
+                print(
+                    f"[{base_currency}] Price: {format_price(price)} | RSI: {rsi:.2f} | "
+                    f"Stop: {format_price(pos['trailing_stop_price'])} | "
+                    f"Position: {'YES' if pos['in_position'] else 'NO'} | "
+                    f"Profile: {profile_name}"
+                )
+            else:
+                print(
+                    f"[{base_currency}] Price: {format_price(price)} | RSI: n/a | "
+                    f"Stop: {format_price(pos['trailing_stop_price'])} | "
+                    f"Position: YES | Profile: {profile_name} (exit-only)"
+                )
 
             if not pos["in_position"]:
                 current_time = time.time()
@@ -1641,8 +1711,10 @@ while True:
                     if pending_order_id:
                         continue
 
-                potential_stop = price - (atr * dynamic_atr_multiplier)
-                if potential_stop > pos["trailing_stop_price"]:
+                potential_stop = None
+                if indicators_ok and not pd.isna(atr) and atr > 0:
+                    potential_stop = price - (atr * dynamic_atr_multiplier)
+                if potential_stop is not None and potential_stop > pos["trailing_stop_price"]:
                     pos["trailing_stop_price"] = potential_stop
 
                 if (
