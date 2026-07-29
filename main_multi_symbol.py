@@ -307,6 +307,39 @@ def place_exit_order(
         return False
 
 
+def configure_effective_leverage(exchange, symbols: List[str], requested_leverage: int, journal) -> Dict[str, int]:
+    effective_leverage_by_symbol = {symbol: 1 for symbol in symbols}
+    if requested_leverage <= 1:
+        print("⚡ Leverage disabled; sizing spot positions at 1x.")
+        return effective_leverage_by_symbol
+
+    for symbol in symbols:
+        try:
+            exchange.set_leverage(requested_leverage, symbol)
+            effective_leverage_by_symbol[symbol] = requested_leverage
+        except Exception as exc:
+            journal.log_event(
+                "warning",
+                symbol=symbol,
+                reason="set_leverage_not_supported",
+                status="warning",
+                payload={"message": str(exc), "requested_leverage": requested_leverage},
+            )
+            print(
+                f"⚠️  Could not set leverage for {symbol}: {exc}. "
+                "Sizing this symbol at 1x so exits match the purchased spot amount."
+            )
+
+    leveraged_symbols = [
+        symbol
+        for symbol, effective_leverage in effective_leverage_by_symbol.items()
+        if effective_leverage == requested_leverage
+    ]
+    if leveraged_symbols:
+        print(f"⚡ Leverage set to {requested_leverage}x for: {', '.join(leveraged_symbols)}")
+    return effective_leverage_by_symbol
+
+
 def get_regime_state(exchange, benchmark_symbols: List[str], regime_timeframe: str) -> Tuple[str, Dict[str, Dict]]:
     snapshots = {}
     bullish = 0
@@ -587,18 +620,7 @@ except Exception as exc:
     print(f"❌ Connection Error: {exc}")
     sys.exit()
 
-try:
-    for symbol in symbols:
-        exchange.set_leverage(leverage, symbol)
-    print(f"⚡ Leverage set to {leverage}x for all symbols.")
-except Exception as exc:
-    journal.log_event(
-        "warning",
-        reason="set_leverage_not_supported",
-        status="warning",
-        payload={"message": str(exc)},
-    )
-    print(f"⚠️  Could not set leverage automatically: {exc}")
+effective_leverage_by_symbol = configure_effective_leverage(exchange, symbols, leverage, journal)
 
 if leverage > 1:
     print(
@@ -676,6 +698,7 @@ journal.log_event(
         "regime_symbols": benchmark_symbols,
         "risk_pct": risk_pct,
         "leverage": leverage,
+        "effective_leverage_by_symbol": effective_leverage_by_symbol,
         "enable_trading": enable_trading,
         "journal_backend": journal.describe_backend(),
     },
@@ -860,7 +883,8 @@ while True:
 
                 if price_above_ema and rsi_strong and trend_strong_enough and ema_trending_up and volume_adequate:
                     risk_slice = risk_pct * symbol_weights[symbol] / total_risk_weight
-                    amount, cost = get_position_size(exchange, symbol, price, risk_slice, leverage)
+                    effective_leverage = effective_leverage_by_symbol.get(symbol, 1)
+                    amount, cost = get_position_size(exchange, symbol, price, risk_slice, effective_leverage)
 
                     if cost < min_order_size:
                         journal.log_event(
