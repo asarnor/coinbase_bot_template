@@ -10,6 +10,7 @@ P&L tally, and loss-limit halt. A losing or maxed-out coin is paused for the res
 the UTC day while the other coins keep trading normally.
 """
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Dict, List, Optional, Tuple
 
 
@@ -212,3 +213,101 @@ def evaluate_entry_limits(
             reasons.append("setup_not_stronger")
 
     return reasons
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not isfinite(number):
+        return default
+    return number
+
+
+def restore_open_positions_from_events(events: List[Dict]) -> Dict[str, Dict]:
+    """Replay journaled fills and return still-open bot positions keyed by symbol.
+
+    Only `entry_executed` / `exit_executed` events count. Startup balance
+    reconciliations are ignored so a previous mark-price estimate cannot be
+    treated as a real entry on the next restart.
+    """
+    open_positions: Dict[str, Dict] = {}
+    for event in events:
+        event_type = event.get("event_type")
+        symbol = event.get("symbol")
+        if not symbol:
+            continue
+        if event_type == "entry_executed":
+            open_positions[symbol] = {
+                "entry_price": _safe_float(event.get("price")),
+                "amount": _safe_float(event.get("amount")),
+            }
+        elif event_type == "exit_executed":
+            open_positions.pop(symbol, None)
+    return open_positions
+
+
+def plan_reconciled_position(
+    held_amount: float,
+    usd_value: float,
+    min_value_usd: float,
+    current_price: float,
+    atr: float,
+    atr_multiplier: float,
+    profit_target_pct: float,
+    journal_position: Optional[Dict] = None,
+) -> Optional[Dict]:
+    """Decide how to adopt an exchange balance after a bot restart.
+
+    Unknown-origin holdings (no journaled fill) are marked in-position so the
+    bot will not buy more of the same coin, but `manage_exits` is False. Arming
+    an ATR stop at mark price against the full wallet would sell long-term
+    BTC/ETH/etc. on the next small dip.
+
+    Journaled bot entries restore the recorded size (capped by what is actually
+    held) and keep stop/profit management enabled.
+    """
+    held_amount = _safe_float(held_amount)
+    usd_value = _safe_float(usd_value)
+    current_price = _safe_float(current_price)
+    if held_amount <= 0 or current_price <= 0:
+        return None
+    if usd_value < max(_safe_float(min_value_usd), 1.0):
+        return None
+
+    journal_entry = 0.0
+    journal_amount = 0.0
+    if journal_position:
+        journal_entry = _safe_float(journal_position.get("entry_price"))
+        journal_amount = _safe_float(journal_position.get("amount"))
+
+    if journal_entry > 0 and journal_amount > 0:
+        amount = min(held_amount, journal_amount)
+        atr_value = _safe_float(atr)
+        if atr_value > 0:
+            trailing_stop = current_price - (atr_value * max(_safe_float(atr_multiplier), 0.0))
+        else:
+            trailing_stop = 0.0
+        peak = current_price if current_price > journal_entry else journal_entry
+        return {
+            "in_position": True,
+            "position_amount": amount,
+            "entry_price": journal_entry,
+            "peak_price": peak,
+            "trailing_stop_price": trailing_stop,
+            "trailing_profit_target": journal_entry * (1 + _safe_float(profit_target_pct)),
+            "breakeven_set": False,
+            "manage_exits": True,
+        }
+
+    return {
+        "in_position": True,
+        "position_amount": held_amount,
+        "entry_price": 0.0,
+        "peak_price": current_price,
+        "trailing_stop_price": 0.0,
+        "trailing_profit_target": 0.0,
+        "breakeven_set": False,
+        "manage_exits": False,
+    }

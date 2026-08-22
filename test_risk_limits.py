@@ -12,9 +12,11 @@ from risk_limits import (
     evaluate_entry_limits,
     extract_fill,
     new_daily_state,
+    plan_reconciled_position,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    restore_open_positions_from_events,
     setup_is_stronger,
     symbol_loss_limit_hit,
     symbol_realized_pnl,
@@ -283,6 +285,164 @@ class StrongerSetupTests(unittest.TestCase):
         state = self._state_with_entry(STRONG)
         reasons = evaluate_entry_limits(state, "BTC/USD", 1, 3, 0, 6, 0.05)
         self.assertNotIn("setup_not_stronger", reasons)
+
+
+class RestoreOpenPositionsTests(unittest.TestCase):
+    def test_entry_without_exit_stays_open(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.05},
+            {"event_type": "entry_executed", "symbol": "BTC/USD", "price": 60000, "amount": 0.01},
+        ]
+        restored = restore_open_positions_from_events(events)
+        self.assertEqual(restored["ETH/USD"]["amount"], 0.05)
+        self.assertEqual(restored["BTC/USD"]["entry_price"], 60000)
+
+    def test_exit_clears_open_entry(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.05},
+            {"event_type": "exit_executed", "symbol": "ETH/USD", "price": 3100, "amount": 0.05},
+        ]
+        self.assertEqual(restore_open_positions_from_events(events), {})
+
+    def test_later_entry_replaces_earlier_one(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 2800, "amount": 0.1},
+            {"event_type": "exit_executed", "symbol": "ETH/USD"},
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.04},
+        ]
+        restored = restore_open_positions_from_events(events)
+        self.assertAlmostEqual(restored["ETH/USD"]["entry_price"], 3000)
+        self.assertAlmostEqual(restored["ETH/USD"]["amount"], 0.04)
+
+    def test_balance_reconcile_events_are_not_treated_as_entries(self):
+        events = [
+            {
+                "event_type": "position_reconciled",
+                "symbol": "ETH/USD",
+                "price": 3000,
+                "amount": 2.0,
+            }
+        ]
+        self.assertEqual(restore_open_positions_from_events(events), {})
+
+
+class PlanReconciledPositionTests(unittest.TestCase):
+    def test_unknown_holdings_do_not_arm_a_stop(self):
+        # Concrete dump trigger: 2 ETH savings, no journaled bot fill, 5m ATR stop
+        # at mark would fire on a <1% dip and sell the whole bag.
+        planned = plan_reconciled_position(
+            held_amount=2.0,
+            usd_value=7000.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=10.0,
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+        )
+        self.assertIsNotNone(planned)
+        self.assertTrue(planned["in_position"])
+        self.assertFalse(planned["manage_exits"])
+        self.assertEqual(planned["trailing_stop_price"], 0.0)
+        self.assertEqual(planned["entry_price"], 0.0)
+        self.assertEqual(planned["position_amount"], 2.0)
+        # A live price just under the old mark-ATR stop must not be a stop-out.
+        old_synthetic_stop = 3500.0 - (10.0 * 1.6)
+        self.assertGreater(3490.0, old_synthetic_stop)
+        self.assertGreater(3490.0, planned["trailing_stop_price"])
+
+    def test_journaled_fill_caps_size_to_bot_amount(self):
+        planned = plan_reconciled_position(
+            held_amount=2.0,
+            usd_value=7000.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=10.0,
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+            journal_position={"entry_price": 3000.0, "amount": 0.05},
+        )
+        self.assertTrue(planned["manage_exits"])
+        self.assertAlmostEqual(planned["position_amount"], 0.05)
+        self.assertAlmostEqual(planned["entry_price"], 3000.0)
+        self.assertAlmostEqual(planned["trailing_stop_price"], 3500.0 - 16.0)
+        self.assertAlmostEqual(planned["trailing_profit_target"], 3000.0 * 1.03)
+
+    def test_journaled_amount_cannot_exceed_holdings(self):
+        planned = plan_reconciled_position(
+            held_amount=0.04,
+            usd_value=140.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=10.0,
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+            journal_position={"entry_price": 3000.0, "amount": 0.05},
+        )
+        self.assertAlmostEqual(planned["position_amount"], 0.04)
+        self.assertTrue(planned["manage_exits"])
+
+    def test_dust_below_minimum_is_ignored(self):
+        self.assertIsNone(
+            plan_reconciled_position(
+                held_amount=0.0001,
+                usd_value=0.35,
+                min_value_usd=5.0,
+                current_price=3500.0,
+                atr=10.0,
+                atr_multiplier=1.6,
+                profit_target_pct=0.03,
+            )
+        )
+
+    def test_invalid_atr_does_not_create_nan_stop(self):
+        planned = plan_reconciled_position(
+            held_amount=0.05,
+            usd_value=175.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=float("nan"),
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+            journal_position={"entry_price": 3000.0, "amount": 0.05},
+        )
+        self.assertTrue(planned["manage_exits"])
+        self.assertEqual(planned["trailing_stop_price"], 0.0)
+
+    def test_profit_target_with_zero_entry_is_not_immediately_true(self):
+        # Guard the historic trap: entry_price=0 made profit_target_price=0, so
+        # any market price looked like a target hit and sold the wallet.
+        planned = plan_reconciled_position(
+            held_amount=2.0,
+            usd_value=7000.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=10.0,
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+        )
+        self.assertEqual(planned["trailing_profit_target"], 0.0)
+        self.assertFalse(planned["manage_exits"])
+
+
+class JournalLifecycleQueryTests(unittest.TestCase):
+    def test_lifecycle_query_skips_non_fill_events(self):
+        import os
+        import tempfile
+
+        from trading_journal import TradingJournal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "journal.db")
+            journal = TradingJournal(database_url=None, sqlite_path=path, enabled=True)
+            journal.log_event("entry_executed", symbol="ETH/USD", price=3000, amount=0.05)
+            journal.log_event("signal_evaluation", symbol="ETH/USD")
+            journal.log_event("exit_executed", symbol="ETH/USD", price=3100, amount=0.05)
+            rows = journal.get_trade_lifecycle_events()
+            journal.close()
+
+        self.assertEqual([row["event_type"] for row in rows], ["entry_executed", "exit_executed"])
+        restored = restore_open_positions_from_events(rows)
+        self.assertEqual(restored, {})
 
 
 def price_for(cost, amount):

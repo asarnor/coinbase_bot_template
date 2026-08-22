@@ -21,9 +21,11 @@ from risk_limits import (
     evaluate_entry_limits,
     extract_fill,
     new_daily_state,
+    plan_reconciled_position,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    restore_open_positions_from_events,
     symbol_loss_limit_hit,
 )
 from trading_journal import TradingJournal
@@ -55,6 +57,7 @@ def reset_position_state(position: Dict, record_exit: bool = False) -> None:
     position["peak_price"] = 0.0
     position["trailing_profit_target"] = 0.0
     position["breakeven_set"] = False
+    position["manage_exits"] = True
 
 
 def fetch_data(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
@@ -399,14 +402,25 @@ def reconcile_open_positions(
     """Rebuild in-memory position state from existing exchange balances on startup.
 
     Without this, a restart forgets open positions, so their stops go unmanaged and
-    the bot may re-buy coins already held. Entry price is unknown after a restart, so
-    the current price is used as a best-effort proxy for stop/target placement.
+    the bot may re-buy coins already held.
+
+    Full-wallet mark-price ATR stops are unsafe: they treat long-term BTC/ETH bags
+    as bot inventory and can sell them on the next small dip. Only journaled
+    `entry_executed` fills are stop-managed. Other holdings block new buys only.
     """
     try:
         balance = exchange.fetch_balance()
     except Exception as exc:
         print(f"⚠️  Could not fetch balance for reconciliation: {exc}")
         return
+
+    journal_positions: Dict[str, Dict] = {}
+    try:
+        journal_positions = restore_open_positions_from_events(
+            journal.get_trade_lifecycle_events()
+        )
+    except Exception as exc:
+        print(f"⚠️  Could not restore journaled positions: {exc}")
 
     for symbol in symbols:
         base_currency = symbol.split("/")[0]
@@ -425,32 +439,52 @@ def reconcile_open_positions(
         price = row["close"]
         atr = row["atr"]
         usd_value = held_amount * price
-        if usd_value < max(min_value_usd, 1.0):
-            continue
-
         profile_name = symbol_profiles[symbol]
         profile = profile_settings[profile_name]
-        pos = positions[symbol]
-        pos["in_position"] = True
-        pos["position_amount"] = held_amount
-        pos["entry_price"] = price
-        pos["peak_price"] = price
-        pos["trailing_stop_price"] = price - (atr * profile["atr_multiplier"])
-        pos["trailing_profit_target"] = price * (1 + profile["profit_target_pct"])
-        pos["breakeven_set"] = False
-        print(
-            f"[{base_currency}] ♻️  Reconciled existing position: {held_amount:.6f} "
-            f"@ ~{format_price(price)} (${usd_value:.2f})"
+        planned = plan_reconciled_position(
+            held_amount,
+            usd_value,
+            min_value_usd,
+            price,
+            atr,
+            profile["atr_multiplier"],
+            profile["profit_target_pct"],
+            journal_positions.get(symbol),
         )
+        if planned is None:
+            continue
+
+        pos = positions[symbol]
+        pos.update(planned)
+        if planned["manage_exits"]:
+            print(
+                f"[{base_currency}] ♻️  Restored journaled position: "
+                f"{planned['position_amount']:.6f} @ {format_price(planned['entry_price'])} "
+                f"(held {held_amount:.6f}, ${usd_value:.2f})"
+            )
+        else:
+            print(
+                f"[{base_currency}] ♻️  Existing {held_amount:.6f} {base_currency} "
+                f"(${usd_value:.2f}) has no journaled entry. Blocking new buys and "
+                "NOT placing stops so long-term holdings are not sold."
+            )
         journal.log_event(
             "position_reconciled",
             symbol=symbol,
             profile=profile_name,
-            status="reconciled",
-            price=price,
-            amount=held_amount,
+            status="restored" if planned["manage_exits"] else "hold_only",
+            price=planned["entry_price"] or price,
+            amount=planned["position_amount"],
             cost_usd=usd_value,
-            payload={"note": "entry_price is a best-effort estimate from current price"},
+            payload={
+                "manage_exits": planned["manage_exits"],
+                "held_amount": held_amount,
+                "note": (
+                    "restored from journaled fill"
+                    if planned["manage_exits"]
+                    else "unknown-origin holding; exits disabled to avoid selling savings"
+                ),
+            },
         )
 
 
@@ -617,6 +651,7 @@ for symbol in symbols:
         "peak_price": 0.0,
         "trailing_profit_target": 0.0,
         "last_exit_time": 0,
+        "manage_exits": True,
     }
 
 if reconcile_on_start:
@@ -913,6 +948,7 @@ while True:
                         pos["trailing_profit_target"] = effective_price * (1 + dynamic_profit_target)
                         pos["in_position"] = True
                         pos["breakeven_set"] = False
+                        pos["manage_exits"] = True
                         record_trade(daily_state, symbol, signal=current_signal)
                         journal.log_event(
                             "entry_executed",
@@ -947,6 +983,9 @@ while True:
                         )
 
             else:
+                if not pos.get("manage_exits", True):
+                    continue
+
                 entry_price = pos["entry_price"]
                 profit_pct = (price - entry_price) / entry_price if entry_price > 0 else 0
 
