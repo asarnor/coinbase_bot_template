@@ -141,6 +141,7 @@ Runtime loading behavior:
 | Variable | Purpose | Example / Default |
 | --- | --- | --- |
 | `APP_ROLE` | Selects runtime role for `app_entrypoint.py` | `bot` |
+| `BOT_EXECUTE` | Live-trading safety switch used by `app_entrypoint.py` when `APP_ROLE=bot`. Leave `false` to deploy in simulation; set `true` to place real orders | `false` |
 | `COINBASE_API_KEY` | Coinbase API key | required |
 | `COINBASE_API_SECRET` | Coinbase API secret | required |
 | `COINBASE_API_PASSPHRASE` | Optional passphrase | optional |
@@ -151,7 +152,7 @@ Runtime loading behavior:
 | `TRADING_REGIME_SYMBOLS` | Higher-timeframe benchmark symbols | `BTC/USD,ETH/USD` |
 | `TRADING_REGIME_TIMEFRAME` | Timeframe used for regime detection | `1h` |
 | `TRADING_TIMEFRAME` | Trading timeframe for signal generation | `5m` |
-| `TRADING_LEVERAGE` | Requested leverage setting | `5` |
+| `TRADING_LEVERAGE` | Requested leverage setting. Coinbase Advanced Trade spot has no real leverage; this only scales how much USD is deployed per trade, so leave it at `1` unless you are certain your account supports margin | `1` |
 | `TRADING_RISK_PCT` | Total portfolio risk allocated across all tracked symbols | `0.20` |
 | `TRADING_CHECK_INTERVAL` | Seconds between cycles | `60` |
 | `TRADING_COOLDOWN_MINUTES` | Cooldown after exits | `5` |
@@ -225,11 +226,14 @@ For persistent storage, provide `DATABASE_URL` and the bot will automatically sw
 ### What Gets Logged
 
 - bot startup
-- market regime changes
+- market regime changes (including a degraded-quorum note if a benchmark's data was unavailable that cycle)
 - signal evaluations
 - blocked entry reasons
 - skipped entries
 - executed entries and exits
+- pending limit orders that later filled or were cancelled as stale
+- resting limit order IDs restored from the journal after a restart (so a redeploy does not forget open limits and place overlapping orders)
+- daily risk state restored from the journal after a restart
 - warnings and runtime errors
 - portfolio snapshots
 
@@ -313,7 +317,10 @@ This repo is set up to deploy through:
 
 The entrypoint chooses behavior by `APP_ROLE`:
 
-- `bot`: runs `main_multi_symbol.py --execute`
+- `bot`: runs `main_multi_symbol.py`. Live trading is a separate opt-in: it only
+  appends `--execute` when `BOT_EXECUTE=true`. Leave `BOT_EXECUTE` unset or `false`
+  and the deploy runs in simulation -- useful for verifying a deploy before risking
+  real funds, but easy to mistake for a live worker if you don't set the switch.
 - `daily_report`: generates yesterday's report
 - `daily_report_email`: generates and emails yesterday's report
 
@@ -336,14 +343,22 @@ Minimum worker variables:
 
 ```bash
 APP_ROLE=bot
+BOT_EXECUTE=true
 COINBASE_API_KEY=...
 COINBASE_API_SECRET=...
 TRADING_SYMBOLS=ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD
+TRADING_LEVERAGE=1
 TRADING_RISK_PCT=0.20
 TRADING_JOURNAL_ENABLED=true
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 REPORT_TIMEZONE=America/Los_Angeles
 ```
+
+`BOT_EXECUTE=true` is what makes this worker actually place orders -- omit it (or
+set it to `false`) to deploy the same worker in simulation first. `TRADING_LEVERAGE`
+is included explicitly here too: Coinbase Advanced Trade spot has no real leverage,
+and the code's own fallback default is `1`, but it's worth setting explicitly so a
+value isn't inherited from an old variable or a copy-pasted config.
 
 Deploy the worker and confirm logs show:
 
@@ -351,6 +366,7 @@ Deploy the worker and confirm logs show:
 - symbol profile assignments
 - current regime
 - `Journal backend: Postgres via DATABASE_URL`
+- `app_entrypoint: BOT_EXECUTE=true -> LIVE trading enabled` (if you intended to go live -- if you see `SIMULATION mode` instead, `BOT_EXECUTE` isn't set)
 
 ### Daily Report Job Setup
 
@@ -386,6 +402,13 @@ Examples for `8:10 AM` Los Angeles time:
 
 If you want the job to run at the same Los Angeles wall-clock time year-round, you will need to adjust the UTC schedule when DST changes.
 
+Note that this is a different clock from the bot's own daily risk limits: per-coin
+trade counts and loss halts (`risk_limits.py`) always reset at UTC midnight,
+regardless of `REPORT_TIMEZONE`. A report for "yesterday" in Los Angeles time and
+the risk-limit "day" it describes can therefore be offset by several hours -- if
+you're reconciling a loss-limit halt against a report, check the event's UTC
+timestamp in the journal rather than assuming the two day boundaries line up.
+
 ## Local Docker Run
 
 Build:
@@ -419,7 +442,9 @@ If you are starting fresh, use the Python multi-symbol stack documented in this 
 ## Safety Notes
 
 - Start with sandbox mode first
-- Do not enable `--execute` until you are comfortable with the symbol list, thresholds, and sizing
-- Review logs after deploys to confirm the bot is actually on the expected journal backend
+- Do not enable `--execute` (or `BOT_EXECUTE=true` on Railway) until you are comfortable with the symbol list, thresholds, and sizing
+- Review logs after deploys to confirm the bot is actually on the expected journal backend, and that you see `LIVE trading enabled` if that's what you intended
+- Per-coin daily trade counts, realized P&L, and loss-limit halts are restored from the journal on startup, so a restart mid-day does not quietly reset a coin's halt. This requires `TRADING_JOURNAL_ENABLED=true` with a working backend; if the journal can't be reached, the bot falls back to starting the day's counters fresh
+- With `TRADING_RECONCILE_ON_START=true` (default) and no `--execute`, the bot will read your real balances and simulate managing them -- a simulated "exit" of a reconciled position does not touch your actual holdings, only the bot's own tracking of them. The logs say so explicitly when this happens
 - Keep your API keys and `.env` files out of version control
 - No strategy guarantees profits; treat this repo as automation infrastructure, not financial advice

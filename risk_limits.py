@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Pure, testable helpers for position sizing, order fills, and per-coin daily risk limits.
+"""Pure, testable helpers for position sizing, order fills, per-coin daily risk
+limits, restart-safe state recovery (daily risk counters and resting limit
+orders), and startup config validation.
 
 These functions intentionally have no side effects and never touch the exchange or
 network, so they can be imported and unit-tested in isolation. The trading bot
@@ -9,8 +11,9 @@ Daily limits are tracked PER COIN: each symbol gets its own trade counter, reali
 P&L tally, and loss-limit halt. A losing or maxed-out coin is paused for the rest of
 the UTC day while the other coins keep trading normally.
 """
+import json
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def current_day_key(now: Optional[datetime] = None) -> str:
@@ -164,6 +167,241 @@ def setup_is_stronger(
 
     average_ratio = sum(ratios) / len(ratios)
     return average_ratio >= 1.0 + min_improvement
+
+
+def _decode_event_payload(event: Dict) -> Dict[str, Any]:
+    """Best-effort decode of a journaled event's payload back into a dict.
+
+    `TradingJournal` stores payloads as a JSON string (`payload_json`); some callers
+    may also pass an already-decoded `payload` dict directly (e.g. in tests).
+    """
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    raw = event.get("payload_json")
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+        return decoded if isinstance(decoded, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def restore_pending_orders_from_events(
+    positions: Dict[str, Dict],
+    events: List[Dict],
+) -> Dict[str, Dict]:
+    """Replay journal events to recover resting limit-order IDs after a restart.
+
+    Pending limit orders are tracked in process memory (`pending_order_id` on each
+    position). A redeploy / crash clears that state while the order can still rest
+    on the exchange, so the next cycle may place a second overlapping order for the
+    same symbol. The journal already records `order_id` on
+    `entry_unfilled_or_failed` / `exit_unfilled_or_failed` and on the resolve events
+    (`pending_order_cancelled`, `pending_*_order_filled`, and matching
+    `entry_executed` / `exit_executed`). Replaying those chronologically restores
+    whichever order is still unresolved per symbol so `sync_pending_order` can
+    cancel or apply the fill instead of abandoning it.
+
+    Returns a dict of symbol -> restored pending summary (for startup logging).
+    Mutates `positions` in place.
+    """
+    # Working copy while replaying; only applied to `positions` at the end so a
+    # mid-replay clear does not leave a half-applied id on a live position dict.
+    pending_by_symbol: Dict[str, Optional[Dict]] = {symbol: None for symbol in positions}
+
+    open_event_types = {"entry_unfilled_or_failed", "exit_unfilled_or_failed"}
+    clear_event_types = {
+        "pending_order_cancelled",
+        "pending_buy_order_filled",
+        "pending_sell_order_filled",
+        "entry_executed",
+        "exit_executed",
+    }
+
+    for event in events:
+        symbol = event.get("symbol")
+        if not symbol or symbol not in pending_by_symbol:
+            continue
+
+        event_type = event.get("event_type")
+        order_id = event.get("order_id") or None
+        current = pending_by_symbol[symbol]
+
+        if event_type in open_event_types and order_id:
+            side = event.get("side")
+            if not side:
+                side = "buy" if event_type.startswith("entry_") else "sell"
+            try:
+                amount = float(event.get("amount") or 0.0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            try:
+                price = float(event.get("price") or 0.0)
+            except (TypeError, ValueError):
+                price = 0.0
+
+            payload = _decode_event_payload(event)
+            signal = None
+            if side == "buy":
+                # Prefer an explicit nested signal dict; fall back to flat payload
+                # keys written by older journal rows.
+                nested = payload.get("signal")
+                if isinstance(nested, dict):
+                    signal = {
+                        "rsi": nested.get("rsi"),
+                        "trend_strength": nested.get("trend_strength"),
+                        "volume_ratio": nested.get("volume_ratio"),
+                    }
+                elif any(k in payload for k in ("rsi", "trend_strength", "volume_ratio")):
+                    signal = {
+                        "rsi": payload.get("rsi"),
+                        "trend_strength": payload.get("trend_strength"),
+                        "volume_ratio": payload.get("volume_ratio"),
+                    }
+
+            pending_by_symbol[symbol] = {
+                "pending_order_id": str(order_id),
+                "pending_order_side": side,
+                "pending_order_amount": amount,
+                "pending_order_price": price,
+                "pending_entry_signal": signal,
+            }
+            continue
+
+        if event_type not in clear_event_types or current is None:
+            continue
+
+        tracked_id = current.get("pending_order_id")
+        tracked_side = current.get("pending_order_side")
+
+        if order_id and str(order_id) != str(tracked_id):
+            # A fill/cancel for a *different* order must not drop tracking of the
+            # still-resting limit -- that is exactly the overlapping-order bug.
+            continue
+
+        if not order_id and event_type in ("entry_executed", "exit_executed"):
+            # Market (or otherwise untagged) fill for this symbol: only clear when
+            # the side matches, so a buy fill does not erase a resting sell limit.
+            if event_type == "entry_executed" and tracked_side != "buy":
+                continue
+            if event_type == "exit_executed" and tracked_side != "sell":
+                continue
+
+        pending_by_symbol[symbol] = None
+
+    restored: Dict[str, Dict] = {}
+    for symbol, pending in pending_by_symbol.items():
+        if not pending:
+            continue
+        pos = positions[symbol]
+        pos["pending_order_id"] = pending["pending_order_id"]
+        pos["pending_order_side"] = pending["pending_order_side"]
+        pos["pending_order_amount"] = pending["pending_order_amount"]
+        pos["pending_order_price"] = pending["pending_order_price"]
+        pos["pending_entry_signal"] = pending["pending_entry_signal"]
+        restored[symbol] = {
+            "order_id": pending["pending_order_id"],
+            "side": pending["pending_order_side"],
+            "amount": pending["pending_order_amount"],
+            "price": pending["pending_order_price"],
+        }
+    return restored
+
+
+def rebuild_daily_state_from_events(
+    day: str,
+    start_equity_usd: float,
+    events: List[Dict],
+    daily_loss_limit_pct: float = 0.0,
+) -> Dict:
+    """Reconstruct a day's risk-tracking state by replaying journaled events.
+
+    Without this, `daily_state` lives only in process memory: a restart (a Railway
+    redeploy, a host recycle, a transient crash) silently resets every trade count,
+    realized P&L tally, and per-coin loss halt back to zero mid-day, letting a coin
+    that already blew its daily loss budget trade again immediately. `events` should
+    be every `bot_events` row for `day` in ascending `created_at` order, as returned
+    by `TradingJournal.get_events_between`.
+
+    `daily_loss_limit_pct` is optional belt-and-suspenders: beyond replaying explicit
+    `daily_loss_limit_triggered` events, it also re-applies the halt to any coin whose
+    replayed realized loss already breaches the budget, in case that one event was
+    missed (e.g. a transient journal write failure right as the halt was recorded).
+    """
+    state = new_daily_state(day, start_equity_usd)
+
+    for event in events:
+        symbol = event.get("symbol")
+        if not symbol:
+            continue
+        event_type = event.get("event_type")
+
+        if event_type == "entry_executed":
+            payload = _decode_event_payload(event)
+            signal = {
+                "rsi": payload.get("rsi"),
+                "trend_strength": payload.get("trend_strength"),
+                "volume_ratio": payload.get("volume_ratio"),
+            }
+            record_trade(state, symbol, signal=signal)
+        elif event_type == "exit_executed":
+            payload = _decode_event_payload(event)
+            pnl = payload.get("estimated_pnl_usd")
+            if pnl is not None:
+                try:
+                    record_realized_pnl(state, symbol, float(pnl))
+                except (TypeError, ValueError):
+                    pass
+        elif event_type == "daily_loss_limit_triggered":
+            state["symbol_halted"][symbol] = True
+
+    if daily_loss_limit_pct > 0:
+        for symbol in state["symbol_realized_pnl_usd"]:
+            if symbol_loss_limit_hit(state, symbol, daily_loss_limit_pct):
+                state["symbol_halted"][symbol] = True
+
+    return state
+
+
+def validate_symbol_configuration(
+    symbols: List[str],
+    core_symbols: "set",
+    tactical_symbols: "set",
+    speculative_symbols: "set",
+) -> List[str]:
+    """Return human-readable warnings for symbol/profile misconfiguration.
+
+    Two mistakes this catches: a symbol listed in a profile bucket
+    (`TRADING_CORE_SYMBOLS` etc.) but missing from `TRADING_SYMBOLS`, so it silently
+    never trades; and a symbol listed in more than one bucket, so it silently trades
+    under whichever bucket wins the core > tactical > speculative priority order.
+    """
+    warnings: List[str] = []
+    symbol_set = set(symbols)
+    buckets = (
+        ("core", core_symbols),
+        ("tactical", tactical_symbols),
+        ("speculative", speculative_symbols),
+    )
+
+    for label, bucket in buckets:
+        for extra_symbol in sorted(bucket - symbol_set):
+            warnings.append(
+                f"{extra_symbol} is listed in TRADING_{label.upper()}_SYMBOLS but not "
+                "in TRADING_SYMBOLS, so it will never be traded."
+            )
+
+    for symbol in symbols:
+        containing = [label for label, bucket in buckets if symbol in bucket]
+        if len(containing) > 1:
+            warnings.append(
+                f"{symbol} is listed in multiple profile buckets ({', '.join(containing)}); "
+                f"it will be treated as '{containing[0]}' (core > tactical > speculative)."
+            )
+
+    return warnings
 
 
 def evaluate_entry_limits(
