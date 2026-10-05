@@ -407,6 +407,10 @@ while True:
                             print(f"✅ Order executed: {order.get('id', 'N/A')}")
                         except Exception as e:
                             print(f"❌ Order failed: {e}")
+                            # This continue skips the loop delay below. Without an
+                            # explicit wait, a rejected or timed-out buy retries
+                            # immediately and can submit another market order.
+                            time.sleep(check_interval)
                             continue  # Skip position update if order failed
                     else:
                         print(f"   (Simulated - use --execute to enable real trading)")
