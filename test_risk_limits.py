@@ -12,6 +12,7 @@ from risk_limits import (
     evaluate_entry_limits,
     extract_fill,
     new_daily_state,
+    order_failure_is_ambiguous,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
@@ -283,6 +284,85 @@ class StrongerSetupTests(unittest.TestCase):
         state = self._state_with_entry(STRONG)
         reasons = evaluate_entry_limits(state, "BTC/USD", 1, 3, 0, 6, 0.05)
         self.assertNotIn("setup_not_stronger", reasons)
+
+
+class OrderFailureAmbiguityTests(unittest.TestCase):
+    def test_timeout_is_ambiguous(self):
+        class NetworkError(Exception):
+            pass
+
+        class RequestTimeout(NetworkError):
+            pass
+
+        self.assertTrue(order_failure_is_ambiguous(RequestTimeout("timed out")))
+
+    def test_exchange_unavailable_is_ambiguous(self):
+        class NetworkError(Exception):
+            pass
+
+        class ExchangeNotAvailable(NetworkError):
+            pass
+
+        self.assertTrue(order_failure_is_ambiguous(ExchangeNotAvailable("503")))
+
+    def test_bad_response_is_ambiguous(self):
+        class OperationFailed(Exception):
+            pass
+
+        class BadResponse(OperationFailed):
+            pass
+
+        self.assertTrue(order_failure_is_ambiguous(BadResponse("malformed")))
+
+    def test_connection_error_is_ambiguous(self):
+        self.assertTrue(order_failure_is_ambiguous(ConnectionError("reset")))
+
+    def test_insufficient_funds_is_a_definite_rejection(self):
+        class ExchangeError(Exception):
+            pass
+
+        class InsufficientFunds(ExchangeError):
+            pass
+
+        self.assertFalse(order_failure_is_ambiguous(InsufficientFunds("not enough")))
+
+    def test_invalid_order_is_a_definite_rejection(self):
+        class ExchangeError(Exception):
+            pass
+
+        class InvalidOrder(ExchangeError):
+            pass
+
+        self.assertFalse(order_failure_is_ambiguous(InvalidOrder("below minimum")))
+
+    def test_rate_limit_is_a_definite_rejection(self):
+        class NetworkError(Exception):
+            pass
+
+        class RateLimitExceeded(NetworkError):
+            pass
+
+        self.assertFalse(order_failure_is_ambiguous(RateLimitExceeded("429")))
+
+    def test_nonce_error_is_a_definite_rejection(self):
+        class NetworkError(Exception):
+            pass
+
+        class InvalidNonce(NetworkError):
+            pass
+
+        self.assertFalse(order_failure_is_ambiguous(InvalidNonce("timestamp expired")))
+
+    def test_internal_server_error_text_is_ambiguous_even_on_exchange_error(self):
+        class ExchangeError(Exception):
+            pass
+
+        self.assertTrue(
+            order_failure_is_ambiguous(ExchangeError("coinbase internal_server_error"))
+        )
+
+    def test_none_is_not_ambiguous(self):
+        self.assertFalse(order_failure_is_ambiguous(None))
 
 
 def price_for(cost, amount):
