@@ -21,6 +21,7 @@ from risk_limits import (
     evaluate_entry_limits,
     extract_fill,
     new_daily_state,
+    order_failure_is_ambiguous,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
@@ -55,6 +56,41 @@ def reset_position_state(position: Dict, record_exit: bool = False) -> None:
     position["peak_price"] = 0.0
     position["trailing_profit_target"] = 0.0
     position["breakeven_set"] = False
+    position["orders_halted"] = False
+
+
+def halt_symbol_orders(
+    position: Dict,
+    journal,
+    symbol: str,
+    profile_name: str,
+    regime_label: str,
+    side: str,
+    reason: str,
+) -> None:
+    """Stop sending orders for this symbol for the rest of the process.
+
+    Used when a create-order call fails in a way that does not prove the
+    exchange rejected it. Another buy or sell could double-fill.
+    """
+    position["orders_halted"] = True
+    base_currency = symbol.split("/")[0]
+    print(
+        f"[{base_currency}] 🛑 {reason} result is uncertain. Halting further "
+        f"orders for {symbol} so a timed-out fill cannot be repeated."
+    )
+    journal.log_event(
+        "orders_halted",
+        symbol=symbol,
+        profile=profile_name,
+        regime=regime_label,
+        side=side,
+        reason=reason,
+        status="halted",
+        payload={
+            "note": "create-order failed ambiguously; no further orders until restart",
+        },
+    )
 
 
 def fetch_data(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
@@ -202,7 +238,8 @@ def place_entry_order(
     use_limit_orders: bool,
     limit_order_offset_pct: float,
     enable_trading: bool,
-) -> Tuple[bool, float, float]:
+) -> Tuple[bool, float, float, bool]:
+    """Return executed, filled amount, average price, and whether the result is ambiguous."""
     if use_limit_orders:
         limit_price = exchange.fetch_ticker(symbol)["last"] * (1 - limit_order_offset_pct)
         print(
@@ -211,7 +248,7 @@ def place_entry_order(
         )
         if not enable_trading:
             print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-            return True, amount, limit_price
+            return True, amount, limit_price, False
 
         try:
             order = exchange.create_limit_buy_order(symbol, amount, limit_price)
@@ -221,33 +258,36 @@ def place_entry_order(
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit order filled")
                 filled, average = extract_fill(order_status, amount, limit_price)
-                return True, filled, average
+                return True, filled, average, False
             print(f"[{base_currency}] ⏳ Limit order still open; waiting for the next cycle")
-            return False, 0.0, 0.0
+            return False, 0.0, 0.0, False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
+            if order_failure_is_ambiguous(exc):
+                print(f"[{base_currency}] 🛑 Not sending a market buy after an uncertain limit entry.")
+                return False, 0.0, 0.0, True
             try:
                 order = exchange.create_market_buy_order(symbol, cost)
                 print(f"[{base_currency}] ✅ Fallback market order executed: {order.get('id', 'N/A')}")
                 filled, average = extract_fill(order, amount, limit_price)
-                return True, filled, average
+                return True, filled, average, False
             except Exception as fallback_exc:
                 print(f"[{base_currency}] ❌ Market entry also failed: {fallback_exc}")
-                return False, 0.0, 0.0
+                return False, 0.0, 0.0, order_failure_is_ambiguous(fallback_exc)
 
     print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True, amount, 0.0
+        return True, amount, 0.0, False
 
     try:
         order = exchange.create_market_buy_order(symbol, cost)
         print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
         filled, average = extract_fill(order, amount, 0.0)
-        return True, filled, average
+        return True, filled, average, False
     except Exception as exc:
         print(f"[{base_currency}] ❌ Order failed: {exc}")
-        return False, 0.0, 0.0
+        return False, 0.0, 0.0, order_failure_is_ambiguous(exc)
 
 
 def place_exit_order(
@@ -260,10 +300,11 @@ def place_exit_order(
     limit_order_offset_pct: float,
     enable_trading: bool,
     force_market: bool = False,
-) -> bool:
+) -> Tuple[bool, bool]:
+    """Return (executed, ambiguous). Ambiguous means the sell may already have filled."""
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True
+        return True, False
 
     # Never try to sell more than we actually hold. Fees/slippage mean the tracked
     # amount can slightly exceed the free base balance, which would bounce the order.
@@ -277,7 +318,7 @@ def place_exit_order(
 
     if amount <= 0:
         print(f"[{base_currency}] ⚠️  No sellable balance for {reason}; skipping order.")
-        return False
+        return False, False
 
     if use_limit_orders and not force_market:
         try:
@@ -292,19 +333,22 @@ def place_exit_order(
             order_status = exchange.fetch_order(order.get("id"), symbol)
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit exit filled")
-                return True
+                return True, False
             print(f"[{base_currency}] ⏳ Exit limit order still open; keeping position state intact")
-            return False
+            return False, False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
+            if order_failure_is_ambiguous(exc):
+                print(f"[{base_currency}] 🛑 Not sending a market sell after an uncertain limit exit.")
+                return False, True
 
     try:
         order = exchange.create_market_sell_order(symbol, amount)
         print(f"[{base_currency}] ✅ {reason} market sell executed: {order.get('id', 'N/A')}")
-        return True
+        return True, False
     except Exception as exc:
         print(f"[{base_currency}] ❌ {reason} sell failed: {exc}")
-        return False
+        return False, order_failure_is_ambiguous(exc)
 
 
 def get_regime_state(exchange, benchmark_symbols: List[str], regime_timeframe: str) -> Tuple[str, Dict[str, Dict]]:
@@ -617,6 +661,7 @@ for symbol in symbols:
         "peak_price": 0.0,
         "trailing_profit_target": 0.0,
         "last_exit_time": 0,
+        "orders_halted": False,
     }
 
 if reconcile_on_start:
@@ -753,12 +798,17 @@ while True:
                 dynamic_spike_reversal *= profile["high_volatility_spike_scale"]
                 dynamic_atr_multiplier *= profile["high_volatility_atr_scale"]
 
+            position_label = (
+                "HALTED" if pos.get("orders_halted") else ("YES" if pos["in_position"] else "NO")
+            )
             print(
                 f"[{base_currency}] Price: {format_price(price)} | RSI: {rsi:.2f} | "
                 f"Stop: {format_price(pos['trailing_stop_price'])} | "
-                f"Position: {'YES' if pos['in_position'] else 'NO'} | "
+                f"Position: {position_label} | "
                 f"Profile: {profile_name}"
             )
+            if pos.get("orders_halted"):
+                continue
 
             if not pos["in_position"]:
                 current_time = time.time()
@@ -892,7 +942,7 @@ while True:
                         )
                         continue
 
-                    entry_executed, filled_amount, fill_price = place_entry_order(
+                    entry_executed, filled_amount, fill_price, entry_ambiguous = place_entry_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -902,6 +952,18 @@ while True:
                         limit_order_offset_pct,
                         enable_trading,
                     )
+
+                    if entry_ambiguous:
+                        halt_symbol_orders(
+                            pos,
+                            journal,
+                            symbol,
+                            profile_name,
+                            regime_label,
+                            "buy",
+                            "entry",
+                        )
+                        continue
 
                     if entry_executed:
                         effective_price = fill_price if fill_price and fill_price > 0 else price
@@ -979,7 +1041,7 @@ while True:
                         f"(Peak was {peak_profit_pct * 100:.2f}%)"
                     )
 
-                    exit_executed = place_exit_order(
+                    exit_executed, exit_ambiguous = place_exit_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -989,6 +1051,11 @@ while True:
                         limit_order_offset_pct,
                         enable_trading,
                     )
+                    if exit_ambiguous:
+                        halt_symbol_orders(
+                            pos, journal, symbol, profile_name, regime_label, "sell", "spike_reversal"
+                        )
+                        continue
                     if exit_executed:
                         journal.log_event(
                             "exit_executed",
@@ -1030,7 +1097,7 @@ while True:
                         f"[{base_currency}] 💰 PROFIT TARGET REACHED: "
                         f"{profit_pct * 100:.2f}% profit at {format_price(price)}"
                     )
-                    exit_executed = place_exit_order(
+                    exit_executed, exit_ambiguous = place_exit_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -1040,6 +1107,11 @@ while True:
                         limit_order_offset_pct,
                         enable_trading,
                     )
+                    if exit_ambiguous:
+                        halt_symbol_orders(
+                            pos, journal, symbol, profile_name, regime_label, "sell", "profit_target"
+                        )
+                        continue
                     if exit_executed:
                         journal.log_event(
                             "exit_executed",
@@ -1079,7 +1151,7 @@ while True:
                         f"[{base_currency}] 💰 TRAILING PROFIT TARGET REACHED: "
                         f"{profit_pct * 100:.2f}% profit at {format_price(price)}"
                     )
-                    exit_executed = place_exit_order(
+                    exit_executed, exit_ambiguous = place_exit_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -1089,6 +1161,11 @@ while True:
                         limit_order_offset_pct,
                         enable_trading,
                     )
+                    if exit_ambiguous:
+                        halt_symbol_orders(
+                            pos, journal, symbol, profile_name, regime_label, "sell", "trailing_profit"
+                        )
+                        continue
                     if exit_executed:
                         journal.log_event(
                             "exit_executed",
@@ -1154,7 +1231,7 @@ while True:
                         f"[{base_currency}] 🚨 STOP LOSS TRIGGERED at {format_price(price)} "
                         f"(Entry: {format_price(entry_price)}, P/L: {profit_pct * 100:.2f}%)"
                     )
-                    exit_executed = place_exit_order(
+                    exit_executed, exit_ambiguous = place_exit_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -1165,6 +1242,11 @@ while True:
                         enable_trading,
                         force_market=True,
                     )
+                    if exit_ambiguous:
+                        halt_symbol_orders(
+                            pos, journal, symbol, profile_name, regime_label, "sell", "stop_loss"
+                        )
+                        continue
                     if exit_executed:
                         journal.log_event(
                             "exit_executed",

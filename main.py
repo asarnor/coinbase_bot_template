@@ -7,6 +7,8 @@ import argparse
 import os
 from dotenv import load_dotenv
 
+from risk_limits import order_failure_is_ambiguous
+
 # Load base .env file first (for shared config)
 load_dotenv()
 
@@ -357,6 +359,7 @@ else:
 in_position = False
 trailing_stop_price = 0.0
 position_amount = 0.0  # Track position size for exit orders
+entry_halted = False  # Set when a live buy may already have been accepted
 
 def get_position_size(current_price):
     try:
@@ -384,7 +387,7 @@ while True:
         print(f"Price: ${price:.2f} | RSI: {rsi:.2f} | Stop: ${trailing_stop_price:.2f}")
 
         # --- BUY LOGIC ---
-        if not in_position:
+        if not in_position and not entry_halted:
             # Trend Filter: Price > EMA 20 AND RSI > 50
             if price > ema_20 and rsi > 50:
                 amount, cost = get_position_size(price)
@@ -407,6 +410,12 @@ while True:
                             print(f"✅ Order executed: {order.get('id', 'N/A')}")
                         except Exception as e:
                             print(f"❌ Order failed: {e}")
+                            if order_failure_is_ambiguous(e):
+                                entry_halted = True
+                                print(
+                                    "🛑 Buy result is uncertain. Halting new buys so a "
+                                    "timed-out fill cannot be repeated."
+                                )
                             continue  # Skip position update if order failed
                     else:
                         print(f"   (Simulated - use --execute to enable real trading)")
@@ -432,6 +441,12 @@ while True:
                         print(f"✅ Sell order executed: {order.get('id', 'N/A')}")
                     except Exception as e:
                         print(f"❌ Sell order failed: {e}")
+                        if order_failure_is_ambiguous(e):
+                            entry_halted = True
+                            print(
+                                "🛑 Sell result is uncertain. Halting new buys so a "
+                                "missed fill cannot be followed by another entry."
+                            )
                 else:
                     print(f"   (Simulated - use --execute to enable real trading)")
                 
