@@ -3,22 +3,27 @@
 
 Run with:  python -m unittest test_risk_limits    (no extra dependencies required)
 """
+import json
 import unittest
 from datetime import datetime, timezone
 
 from risk_limits import (
     compute_position_size,
     current_day_key,
+    daily_profit_target_hit,
     evaluate_entry_limits,
     extract_fill,
     new_daily_state,
+    rebuild_daily_state_from_events,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    restore_pending_orders_from_events,
     setup_is_stronger,
     symbol_loss_limit_hit,
     symbol_realized_pnl,
     symbol_trade_count,
+    validate_symbol_configuration,
 )
 
 
@@ -118,6 +123,7 @@ class DailyStateTests(unittest.TestCase):
         self.assertEqual(state["symbol_trades"], {})
         self.assertEqual(state["symbol_realized_pnl_usd"], {})
         self.assertEqual(state["symbol_halted"], {})
+        self.assertFalse(state["profit_target_halted"])
         self.assertAlmostEqual(state["start_equity_usd"], 1200)
 
 
@@ -204,6 +210,35 @@ class EvaluateEntryLimitsTests(unittest.TestCase):
         reasons = evaluate_entry_limits(state, "FET/USD", 0, 3, 4, 6, 0.05)
         self.assertIn("max_trades_per_day", reasons)
 
+    def test_blocks_all_symbols_after_daily_profit_target(self):
+        state = self._state()
+        record_realized_pnl(state, "ETH/USD", 100.0)
+        reasons = evaluate_entry_limits(
+            state, "BTC/USD", 0, 3, 0, 6, 0.05, daily_profit_target_usd=100
+        )
+        self.assertIn("daily_profit_target", reasons)
+        other = evaluate_entry_limits(
+            state, "LINK/USD", 0, 3, 0, 6, 0.05, daily_profit_target_usd=100
+        )
+        self.assertIn("daily_profit_target", other)
+
+    def test_profit_target_disabled_when_zero(self):
+        state = self._state()
+        record_realized_pnl(state, "ETH/USD", 500.0)
+        reasons = evaluate_entry_limits(
+            state, "BTC/USD", 0, 3, 0, 6, 0.05, daily_profit_target_usd=0
+        )
+        self.assertNotIn("daily_profit_target", reasons)
+        self.assertFalse(daily_profit_target_hit(state, 0))
+
+    def test_profit_target_respects_latched_halt(self):
+        state = self._state()
+        state["profit_target_halted"] = True
+        reasons = evaluate_entry_limits(
+            state, "BTC/USD", 0, 3, 0, 6, 0.05, daily_profit_target_usd=100
+        )
+        self.assertIn("daily_profit_target", reasons)
+
 
 class StrongerSetupTests(unittest.TestCase):
     def _state_with_entry(self, signal):
@@ -288,6 +323,342 @@ class StrongerSetupTests(unittest.TestCase):
 def price_for(cost, amount):
     """Helper: recover the implied price so we can assert amount * price == cost."""
     return cost / amount if amount else 0.0
+
+
+def entry_event(symbol, rsi=60.0, trend_strength=0.02, volume_ratio=1.5, created_at="2026-07-03T10:00:00+00:00"):
+    return {
+        "event_type": "entry_executed",
+        "symbol": symbol,
+        "created_at": created_at,
+        "payload_json": json.dumps(
+            {"rsi": rsi, "trend_strength": trend_strength, "volume_ratio": volume_ratio}
+        ),
+    }
+
+
+def exit_event(symbol, pnl_usd, created_at="2026-07-03T11:00:00+00:00"):
+    return {
+        "event_type": "exit_executed",
+        "symbol": symbol,
+        "created_at": created_at,
+        "payload_json": json.dumps({"estimated_pnl_usd": pnl_usd}),
+    }
+
+
+def halt_event(symbol, created_at="2026-07-03T12:00:00+00:00"):
+    return {"event_type": "daily_loss_limit_triggered", "symbol": symbol, "created_at": created_at}
+
+
+class RebuildDailyStateFromEventsTests(unittest.TestCase):
+    def test_empty_events_matches_new_daily_state(self):
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, [])
+        self.assertEqual(state["trades"], 0)
+        self.assertEqual(state["symbol_trades"], {})
+        self.assertAlmostEqual(state["start_equity_usd"], 1000.0)
+
+    def test_replays_entries_and_exits_per_coin(self):
+        events = [
+            entry_event("BTC/USD"),
+            entry_event("BTC/USD"),
+            entry_event("ETH/USD"),
+            exit_event("BTC/USD", -20.0),
+            exit_event("ETH/USD", 15.0),
+        ]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertEqual(state["trades"], 3)
+        self.assertEqual(symbol_trade_count(state, "BTC/USD"), 2)
+        self.assertEqual(symbol_trade_count(state, "ETH/USD"), 1)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "BTC/USD"), -20.0)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "ETH/USD"), 15.0)
+        self.assertAlmostEqual(state["realized_pnl_usd"], -5.0)
+
+    def test_replays_explicit_halt_events(self):
+        events = [entry_event("BTC/USD"), halt_event("BTC/USD")]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertTrue(state["symbol_halted"].get("BTC/USD"))
+
+    def test_restores_last_entry_signal_for_stronger_reentry_gate(self):
+        events = [entry_event("BTC/USD", rsi=60.0, trend_strength=0.02, volume_ratio=1.5)]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        # A subsequent weaker signal should now be blocked, exactly as if the entry
+        # had happened in this same process rather than before a restart.
+        self.assertFalse(
+            setup_is_stronger(state, "BTC/USD", rsi=50.0, trend_strength=0.01, volume_ratio=1.0)
+        )
+
+    def test_safety_net_halts_symbol_even_without_explicit_event(self):
+        # Loss crossed the 5% budget but the daily_loss_limit_triggered event is
+        # missing (e.g. a transient journal write failure) -- the belt-and-suspenders
+        # recompute should still catch it when a limit pct is supplied.
+        events = [exit_event("BTC/USD", -60.0)]
+        state = rebuild_daily_state_from_events(
+            "2026-07-03", 1000.0, events, daily_loss_limit_pct=0.05
+        )
+        self.assertTrue(state["symbol_halted"].get("BTC/USD"))
+
+    def test_no_safety_net_when_limit_pct_not_supplied(self):
+        events = [exit_event("BTC/USD", -60.0)]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertFalse(state["symbol_halted"].get("BTC/USD"))
+
+    def test_ignores_events_without_a_symbol(self):
+        events = [{"event_type": "bot_started", "symbol": None, "created_at": "2026-07-03T09:00:00+00:00"}]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertEqual(state["trades"], 0)
+
+    def test_restores_profit_target_halt_from_event(self):
+        events = [
+            exit_event("ETH/USD", 120.0),
+            {
+                "event_type": "daily_profit_target_triggered",
+                "symbol": "ETH/USD",
+                "created_at": "2026-07-03T12:00:00+00:00",
+            },
+        ]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertTrue(state["profit_target_halted"])
+
+    def test_safety_net_halts_on_profit_target_without_event(self):
+        events = [exit_event("ETH/USD", 100.0)]
+        state = rebuild_daily_state_from_events(
+            "2026-07-03", 1000.0, events, daily_profit_target_usd=100
+        )
+        self.assertTrue(state["profit_target_halted"])
+
+    def test_malformed_payload_json_does_not_raise(self):
+        events = [{"event_type": "exit_executed", "symbol": "BTC/USD", "payload_json": "{not-json"}]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "BTC/USD"), 0.0)
+
+
+def empty_position():
+    return {
+        "in_position": False,
+        "pending_order_id": None,
+        "pending_order_side": None,
+        "pending_entry_signal": None,
+        "pending_order_amount": 0.0,
+        "pending_order_price": 0.0,
+    }
+
+
+class RestorePendingOrdersFromEventsTests(unittest.TestCase):
+    def test_restores_unresolved_entry_limit(self):
+        positions = {"BTC/USD": empty_position(), "ETH/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "ord-btc-1",
+                "amount": 0.01,
+                "price": 100000.0,
+                "payload_json": json.dumps(
+                    {"signal": {"rsi": 60.0, "trend_strength": 0.02, "volume_ratio": 1.5}}
+                ),
+            }
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(set(restored), {"BTC/USD"})
+        self.assertEqual(positions["BTC/USD"]["pending_order_id"], "ord-btc-1")
+        self.assertEqual(positions["BTC/USD"]["pending_order_side"], "buy")
+        self.assertEqual(positions["BTC/USD"]["pending_order_amount"], 0.01)
+        self.assertEqual(positions["BTC/USD"]["pending_entry_signal"]["rsi"], 60.0)
+        self.assertIsNone(positions["ETH/USD"]["pending_order_id"])
+
+    def test_clears_pending_after_cancel(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "ord-1",
+                "amount": 0.01,
+                "price": 100.0,
+            },
+            {
+                "event_type": "pending_order_cancelled",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "ord-1",
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored, {})
+        self.assertIsNone(positions["BTC/USD"]["pending_order_id"])
+
+    def test_clears_pending_after_late_fill(self):
+        positions = {"ETH/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "ETH/USD",
+                "side": "buy",
+                "order_id": "ord-eth",
+                "amount": 1.0,
+                "price": 3000.0,
+            },
+            {
+                "event_type": "pending_buy_order_filled",
+                "symbol": "ETH/USD",
+                "side": "buy",
+                "order_id": "ord-eth",
+            },
+            {
+                "event_type": "entry_executed",
+                "symbol": "ETH/USD",
+                "side": "buy",
+                "order_id": "ord-eth",
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored, {})
+        self.assertIsNone(positions["ETH/USD"]["pending_order_id"])
+
+    def test_does_not_clear_when_unrelated_order_id_fills(self):
+        # A fill for a different order must not drop tracking of the still-resting
+        # limit -- that would recreate the overlapping-order bug after restart.
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "resting-limit",
+                "amount": 0.01,
+                "price": 100.0,
+            },
+            {
+                "event_type": "entry_executed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "some-other-order",
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored["BTC/USD"]["order_id"], "resting-limit")
+        self.assertEqual(positions["BTC/USD"]["pending_order_id"], "resting-limit")
+
+    def test_restores_unresolved_exit_limit(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "exit_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "sell",
+                "order_id": "sell-1",
+                "amount": 0.5,
+                "price": 110000.0,
+            }
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored["BTC/USD"]["side"], "sell")
+        self.assertEqual(positions["BTC/USD"]["pending_order_id"], "sell-1")
+        self.assertEqual(positions["BTC/USD"]["pending_order_side"], "sell")
+
+    def test_ignores_unfilled_events_without_order_id(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": None,
+                "amount": 0.01,
+                "price": 100.0,
+            }
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored, {})
+        self.assertIsNone(positions["BTC/USD"]["pending_order_id"])
+
+    def test_keeps_latest_unresolved_pending_per_symbol(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "old-order",
+                "amount": 0.01,
+                "price": 90.0,
+            },
+            {
+                "event_type": "pending_order_cancelled",
+                "symbol": "BTC/USD",
+                "order_id": "old-order",
+            },
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "new-order",
+                "amount": 0.02,
+                "price": 95.0,
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored["BTC/USD"]["order_id"], "new-order")
+        self.assertEqual(positions["BTC/USD"]["pending_order_amount"], 0.02)
+
+    def test_market_entry_without_order_id_clears_matching_buy_pending(self):
+        positions = {"BTC/USD": empty_position()}
+        events = [
+            {
+                "event_type": "entry_unfilled_or_failed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": "limit-1",
+                "amount": 0.01,
+                "price": 100.0,
+            },
+            {
+                "event_type": "entry_executed",
+                "symbol": "BTC/USD",
+                "side": "buy",
+                "order_id": None,
+            },
+        ]
+        restored = restore_pending_orders_from_events(positions, events)
+        self.assertEqual(restored, {})
+        self.assertIsNone(positions["BTC/USD"]["pending_order_id"])
+
+
+class ValidateSymbolConfigurationTests(unittest.TestCase):
+    def test_no_warnings_for_clean_configuration(self):
+        warnings = validate_symbol_configuration(
+            ["BTC/USD", "ETH/USD", "LINK/USD"],
+            {"BTC/USD", "ETH/USD"},
+            {"LINK/USD"},
+            set(),
+        )
+        self.assertEqual(warnings, [])
+
+    def test_warns_on_bucket_symbol_missing_from_trading_symbols(self):
+        warnings = validate_symbol_configuration(
+            ["BTC/USD"], {"BTC/USD", "XRP/USD"}, set(), set()
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("XRP/USD", warnings[0])
+        self.assertIn("TRADING_CORE_SYMBOLS", warnings[0])
+
+    def test_warns_on_symbol_in_multiple_buckets(self):
+        warnings = validate_symbol_configuration(
+            ["BTC/USD"], {"BTC/USD"}, {"BTC/USD"}, set()
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("BTC/USD", warnings[0])
+        self.assertIn("core", warnings[0])
+
+    def test_can_report_multiple_distinct_warnings(self):
+        warnings = validate_symbol_configuration(
+            ["BTC/USD", "ETH/USD"],
+            {"BTC/USD", "ETH/USD"},
+            {"ETH/USD", "SOL/USD"},
+            set(),
+        )
+        self.assertEqual(len(warnings), 2)
 
 
 if __name__ == "__main__":
