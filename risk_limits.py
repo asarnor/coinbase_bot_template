@@ -32,6 +32,9 @@ def new_daily_state(day: str, start_equity_usd: float = 0.0) -> Dict:
         "symbol_realized_pnl_usd": {},
         "start_equity_usd": start_equity_usd,
         "symbol_halted": {},
+        # Portfolio-wide halt after hitting TRADING_DAILY_PROFIT_TARGET_USD.
+        # Existing positions can still exit; only new entries are blocked.
+        "profit_target_halted": False,
         # Signal snapshot ({"rsi", "trend_strength", "volume_ratio"}) of each coin's
         # most recent entry today, used to require the next trade to be stronger.
         "symbol_last_entry_signal": {},
@@ -71,6 +74,19 @@ def symbol_trade_count(state: Dict, symbol: str) -> int:
 
 def symbol_realized_pnl(state: Dict, symbol: str) -> float:
     return state["symbol_realized_pnl_usd"].get(symbol, 0.0)
+
+
+def daily_profit_target_hit(state: Dict, target_usd: float) -> bool:
+    """True when today's realized P&L has reached the portfolio profit halt.
+
+    `target_usd <= 0` disables the halt. A latched `profit_target_halted` flag also
+    counts as hit so a restart cannot reopen entries after the target printed.
+    """
+    if state.get("profit_target_halted"):
+        return True
+    if target_usd <= 0:
+        return False
+    return float(state.get("realized_pnl_usd") or 0.0) >= target_usd
 
 
 def symbol_loss_limit_hit(state: Dict, symbol: str, limit_pct: float) -> bool:
@@ -315,6 +331,7 @@ def rebuild_daily_state_from_events(
     start_equity_usd: float,
     events: List[Dict],
     daily_loss_limit_pct: float = 0.0,
+    daily_profit_target_usd: float = 0.0,
 ) -> Dict:
     """Reconstruct a day's risk-tracking state by replaying journaled events.
 
@@ -356,11 +373,16 @@ def rebuild_daily_state_from_events(
                     pass
         elif event_type == "daily_loss_limit_triggered":
             state["symbol_halted"][symbol] = True
+        elif event_type == "daily_profit_target_triggered":
+            state["profit_target_halted"] = True
 
     if daily_loss_limit_pct > 0:
         for symbol in state["symbol_realized_pnl_usd"]:
             if symbol_loss_limit_hit(state, symbol, daily_loss_limit_pct):
                 state["symbol_halted"][symbol] = True
+
+    if daily_profit_target_hit(state, daily_profit_target_usd):
+        state["profit_target_halted"] = True
 
     return state
 
@@ -416,6 +438,7 @@ def evaluate_entry_limits(
     require_stronger_setup: bool = False,
     current_signal: Optional[Dict] = None,
     min_setup_improvement: float = 0.0,
+    daily_profit_target_usd: float = 0.0,
 ) -> List[str]:
     """Return the list of blocking reasons (empty means the trade is allowed).
 
@@ -425,6 +448,8 @@ def evaluate_entry_limits(
     """
     reasons: List[str] = []
 
+    if daily_profit_target_hit(state, daily_profit_target_usd):
+        reasons.append("daily_profit_target")
     if state["symbol_halted"].get(symbol) or symbol_loss_limit_hit(
         state, symbol, daily_loss_limit_pct
     ):

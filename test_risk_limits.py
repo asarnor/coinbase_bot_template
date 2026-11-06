@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from risk_limits import (
     compute_position_size,
     current_day_key,
+    daily_profit_target_hit,
     evaluate_entry_limits,
     extract_fill,
     new_daily_state,
@@ -122,6 +123,7 @@ class DailyStateTests(unittest.TestCase):
         self.assertEqual(state["symbol_trades"], {})
         self.assertEqual(state["symbol_realized_pnl_usd"], {})
         self.assertEqual(state["symbol_halted"], {})
+        self.assertFalse(state["profit_target_halted"])
         self.assertAlmostEqual(state["start_equity_usd"], 1200)
 
 
@@ -207,6 +209,35 @@ class EvaluateEntryLimitsTests(unittest.TestCase):
         # Global cap of 4 reached -> blocked regardless of per-coin room.
         reasons = evaluate_entry_limits(state, "FET/USD", 0, 3, 4, 6, 0.05)
         self.assertIn("max_trades_per_day", reasons)
+
+    def test_blocks_all_symbols_after_daily_profit_target(self):
+        state = self._state()
+        record_realized_pnl(state, "ETH/USD", 100.0)
+        reasons = evaluate_entry_limits(
+            state, "BTC/USD", 0, 3, 0, 6, 0.05, daily_profit_target_usd=100
+        )
+        self.assertIn("daily_profit_target", reasons)
+        other = evaluate_entry_limits(
+            state, "LINK/USD", 0, 3, 0, 6, 0.05, daily_profit_target_usd=100
+        )
+        self.assertIn("daily_profit_target", other)
+
+    def test_profit_target_disabled_when_zero(self):
+        state = self._state()
+        record_realized_pnl(state, "ETH/USD", 500.0)
+        reasons = evaluate_entry_limits(
+            state, "BTC/USD", 0, 3, 0, 6, 0.05, daily_profit_target_usd=0
+        )
+        self.assertNotIn("daily_profit_target", reasons)
+        self.assertFalse(daily_profit_target_hit(state, 0))
+
+    def test_profit_target_respects_latched_halt(self):
+        state = self._state()
+        state["profit_target_halted"] = True
+        reasons = evaluate_entry_limits(
+            state, "BTC/USD", 0, 3, 0, 6, 0.05, daily_profit_target_usd=100
+        )
+        self.assertIn("daily_profit_target", reasons)
 
 
 class StrongerSetupTests(unittest.TestCase):
@@ -374,6 +405,25 @@ class RebuildDailyStateFromEventsTests(unittest.TestCase):
         events = [{"event_type": "bot_started", "symbol": None, "created_at": "2026-07-03T09:00:00+00:00"}]
         state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
         self.assertEqual(state["trades"], 0)
+
+    def test_restores_profit_target_halt_from_event(self):
+        events = [
+            exit_event("ETH/USD", 120.0),
+            {
+                "event_type": "daily_profit_target_triggered",
+                "symbol": "ETH/USD",
+                "created_at": "2026-07-03T12:00:00+00:00",
+            },
+        ]
+        state = rebuild_daily_state_from_events("2026-07-03", 1000.0, events)
+        self.assertTrue(state["profit_target_halted"])
+
+    def test_safety_net_halts_on_profit_target_without_event(self):
+        events = [exit_event("ETH/USD", 100.0)]
+        state = rebuild_daily_state_from_events(
+            "2026-07-03", 1000.0, events, daily_profit_target_usd=100
+        )
+        self.assertTrue(state["profit_target_halted"])
 
     def test_malformed_payload_json_does_not_raise(self):
         events = [{"event_type": "exit_executed", "symbol": "BTC/USD", "payload_json": "{not-json"}]

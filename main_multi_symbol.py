@@ -125,7 +125,7 @@ def build_profile_settings() -> Dict[str, Dict]:
         "core": {
             "label": "core",
             "risk_weight": float(os.getenv("TRADING_CORE_RISK_WEIGHT", "1.00")),
-            "profit_target_pct": env_float("TRADING_CORE_PROFIT_TARGET_PCT", "0.030", "TRADING_PROFIT_TARGET_PCT"),
+            "profit_target_pct": env_float("TRADING_CORE_PROFIT_TARGET_PCT", "0.040", "TRADING_PROFIT_TARGET_PCT"),
             "spike_reversal_pct": env_float("TRADING_CORE_SPIKE_REVERSAL_PCT", "0.018", "TRADING_SPIKE_REVERSAL_PCT"),
             "min_spike_profit_pct": env_float("TRADING_CORE_MIN_SPIKE_PROFIT", "0.015", "TRADING_MIN_SPIKE_PROFIT"),
             "atr_multiplier": env_float("TRADING_CORE_ATR_MULTIPLIER", "1.60", "TRADING_ATR_MULTIPLIER"),
@@ -149,7 +149,7 @@ def build_profile_settings() -> Dict[str, Dict]:
         "tactical": {
             "label": "tactical",
             "risk_weight": float(os.getenv("TRADING_TACTICAL_RISK_WEIGHT", "0.90")),
-            "profit_target_pct": env_float("TRADING_TACTICAL_PROFIT_TARGET_PCT", "0.025", "TRADING_PROFIT_TARGET_PCT"),
+            "profit_target_pct": env_float("TRADING_TACTICAL_PROFIT_TARGET_PCT", "0.030", "TRADING_PROFIT_TARGET_PCT"),
             "spike_reversal_pct": env_float("TRADING_TACTICAL_SPIKE_REVERSAL_PCT", "0.014", "TRADING_SPIKE_REVERSAL_PCT"),
             "min_spike_profit_pct": env_float("TRADING_TACTICAL_MIN_SPIKE_PROFIT", "0.012", "TRADING_MIN_SPIKE_PROFIT"),
             "atr_multiplier": env_float("TRADING_TACTICAL_ATR_MULTIPLIER", "1.80", "TRADING_ATR_MULTIPLIER"),
@@ -682,6 +682,7 @@ def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
             "symbol_trades": state["symbol_trades"],
             "symbol_realized_pnl_usd": state["symbol_realized_pnl_usd"],
             "halted_symbols": [s for s, v in state["symbol_halted"].items() if v],
+            "profit_target_halted": state.get("profit_target_halted", False),
         },
     )
     start_equity = state.get("start_equity_usd", 0.0)
@@ -782,28 +783,29 @@ elif not use_sandbox and os.path.exists(".env.production"):
     load_dotenv(".env.production", override=True)
 
 symbols = parse_symbol_list(
-    os.getenv("TRADING_SYMBOLS", "ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD")
+    os.getenv("TRADING_SYMBOLS", "ETH/USD,BTC/USD,LINK/USD")
 )
-timeframe = os.getenv("TRADING_TIMEFRAME", "5m")
+timeframe = os.getenv("TRADING_TIMEFRAME", "1h")
 leverage = int(os.getenv("TRADING_LEVERAGE", "1"))
 risk_pct = float(os.getenv("TRADING_RISK_PCT", "0.20"))
-check_interval = int(os.getenv("TRADING_CHECK_INTERVAL", "60"))
+check_interval = int(os.getenv("TRADING_CHECK_INTERVAL", "300"))
 cooldown_minutes = int(os.getenv("TRADING_COOLDOWN_MINUTES", "5"))
 min_order_size = float(os.getenv("TRADING_MIN_ORDER_SIZE", "1.00"))
 benchmark_symbols = parse_symbol_list(os.getenv("TRADING_REGIME_SYMBOLS", "BTC/USD,ETH/USD"))
-regime_timeframe = os.getenv("TRADING_REGIME_TIMEFRAME", "1h")
+regime_timeframe = os.getenv("TRADING_REGIME_TIMEFRAME", "4h")
 
-use_limit_orders = os.getenv("TRADING_USE_LIMIT_ORDERS", "false").lower() == "true"
+use_limit_orders = os.getenv("TRADING_USE_LIMIT_ORDERS", "true").lower() == "true"
 limit_order_offset_pct = float(os.getenv("TRADING_LIMIT_ORDER_OFFSET", "0.001"))
 log_signal_checks = os.getenv("TRADING_LOG_SIGNAL_CHECKS", "true").lower() == "true"
 snapshot_interval_minutes = int(os.getenv("TRADING_PORTFOLIO_SNAPSHOT_MINUTES", "30"))
 
 # Risk guardrails (set any to 0 to disable that specific limit).
 # Trade counts and the loss limit are tracked PER COIN.
-max_open_positions = int(os.getenv("TRADING_MAX_OPEN_POSITIONS", "3"))
+max_open_positions = int(os.getenv("TRADING_MAX_OPEN_POSITIONS", "2"))
 max_trades_per_day = int(os.getenv("TRADING_MAX_TRADES_PER_DAY", "0"))
-max_trades_per_symbol_per_day = int(os.getenv("TRADING_MAX_TRADES_PER_SYMBOL_PER_DAY", "6"))
+max_trades_per_symbol_per_day = int(os.getenv("TRADING_MAX_TRADES_PER_SYMBOL_PER_DAY", "2"))
 daily_loss_limit_pct = float(os.getenv("TRADING_DAILY_LOSS_LIMIT_PCT", "0.05"))
+daily_profit_target_usd = float(os.getenv("TRADING_DAILY_PROFIT_TARGET_USD", "100"))
 # Re-entries on a coin must present a signal at least as strong as its previous entry.
 require_stronger_reentry = os.getenv("TRADING_REQUIRE_STRONGER_REENTRY", "true").lower() == "true"
 min_setup_improvement = float(os.getenv("TRADING_MIN_SETUP_IMPROVEMENT", "0.0"))
@@ -813,8 +815,8 @@ reconcile_min_value_usd = float(
 )
 
 core_symbols = set(parse_symbol_list(os.getenv("TRADING_CORE_SYMBOLS", "ETH/USD,BTC/USD")))
-tactical_symbols = set(parse_symbol_list(os.getenv("TRADING_TACTICAL_SYMBOLS", "LINK/USD,SHIB/USD")))
-speculative_symbols = set(parse_symbol_list(os.getenv("TRADING_SPECULATIVE_SYMBOLS", "ALGO/USD,FET/USD")))
+tactical_symbols = set(parse_symbol_list(os.getenv("TRADING_TACTICAL_SYMBOLS", "LINK/USD")))
+speculative_symbols = set(parse_symbol_list(os.getenv("TRADING_SPECULATIVE_SYMBOLS", "")))
 profile_settings = build_profile_settings()
 
 symbol_profiles = {
@@ -994,6 +996,7 @@ print(
     f"max_trades/coin={max_trades_per_symbol_per_day or 'off'} "
     f"max_trades/day_total={max_trades_per_day or 'off'} "
     f"loss_limit/coin={format_pct(daily_loss_limit_pct) if daily_loss_limit_pct > 0 else 'off'} "
+    f"profit_halt={format_price(daily_profit_target_usd) if daily_profit_target_usd > 0 else 'off'} "
     f"stronger_reentry={'on' if require_stronger_reentry else 'off'}"
 )
 if enable_trading:
@@ -1076,12 +1079,18 @@ if day_start_equity_usd is None:
 
 if todays_events:
     daily_state = rebuild_daily_state_from_events(
-        today, day_start_equity_usd, todays_events, daily_loss_limit_pct
+        today,
+        day_start_equity_usd,
+        todays_events,
+        daily_loss_limit_pct,
+        daily_profit_target_usd,
     )
     halted_symbols = [s for s, halted in daily_state["symbol_halted"].items() if halted]
+    profit_halted = daily_state.get("profit_target_halted", False)
     print(
         f"♻️  Restored today's risk state from the journal: {daily_state['trades']} trade(s) "
-        f"so far, halted={halted_symbols or 'none'}"
+        f"so far, halted={halted_symbols or 'none'}, "
+        f"profit_halt={'on' if profit_halted else 'off'}"
     )
     journal.log_event(
         "daily_state_restored",
@@ -1091,6 +1100,7 @@ if todays_events:
             "symbol_trades": daily_state["symbol_trades"],
             "symbol_realized_pnl_usd": daily_state["symbol_realized_pnl_usd"],
             "halted_symbols": halted_symbols,
+            "profit_target_halted": profit_halted,
             "start_equity_usd": day_start_equity_usd,
         },
     )
@@ -1337,7 +1347,27 @@ while True:
                     require_stronger_setup=require_stronger_reentry,
                     current_signal=current_signal,
                     min_setup_improvement=min_setup_improvement,
+                    daily_profit_target_usd=daily_profit_target_usd,
                 )
+                if "daily_profit_target" in limit_reasons and not daily_state.get(
+                    "profit_target_halted"
+                ):
+                    daily_state["profit_target_halted"] = True
+                    print(
+                        f"[{base_currency}] 🛑 Daily profit target reached "
+                        f"(realized {format_price(daily_state.get('realized_pnl_usd', 0.0))}). "
+                        "Pausing new entries until tomorrow; open positions can still exit."
+                    )
+                    journal.log_event(
+                        "daily_profit_target_triggered",
+                        symbol=symbol,
+                        profile=profile_name,
+                        status="halted",
+                        payload={
+                            "realized_pnl_usd": daily_state.get("realized_pnl_usd", 0.0),
+                            "profit_target_usd": daily_profit_target_usd,
+                        },
+                    )
                 # Latch the per-coin halt the first time a coin breaches its loss budget.
                 if "daily_loss_limit" in limit_reasons and not daily_state["symbol_halted"].get(symbol):
                     daily_state["symbol_halted"][symbol] = True

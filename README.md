@@ -43,7 +43,7 @@ The primary maintained path in this repo is the Python multi-symbol bot in `main
 
 ## Strategy Overview
 
-The bot scans a symbol list every cycle and only enters when all required filters line up:
+The maintained path is a **1-hour swing** on ETH, BTC, and LINK. It scans each cycle and only enters when all required filters line up:
 
 - Price is above the short EMA
 - RSI is above the profile threshold
@@ -145,19 +145,22 @@ Runtime loading behavior:
 | `COINBASE_API_KEY` | Coinbase API key | required |
 | `COINBASE_API_SECRET` | Coinbase API secret | required |
 | `COINBASE_API_PASSPHRASE` | Optional passphrase | optional |
-| `TRADING_SYMBOLS` | All tracked symbols | `ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD` |
+| `TRADING_SYMBOLS` | All tracked symbols | `ETH/USD,BTC/USD,LINK/USD` |
 | `TRADING_CORE_SYMBOLS` | Symbols assigned to the `core` profile | `ETH/USD,BTC/USD` |
-| `TRADING_TACTICAL_SYMBOLS` | Symbols assigned to the `tactical` profile | `LINK/USD,SHIB/USD` |
-| `TRADING_SPECULATIVE_SYMBOLS` | Symbols assigned to the `speculative` profile | `ALGO/USD,FET/USD` |
+| `TRADING_TACTICAL_SYMBOLS` | Symbols assigned to the `tactical` profile | `LINK/USD` |
+| `TRADING_SPECULATIVE_SYMBOLS` | Symbols assigned to the `speculative` profile | empty (swing mode) |
 | `TRADING_REGIME_SYMBOLS` | Higher-timeframe benchmark symbols | `BTC/USD,ETH/USD` |
-| `TRADING_REGIME_TIMEFRAME` | Timeframe used for regime detection | `1h` |
-| `TRADING_TIMEFRAME` | Trading timeframe for signal generation | `5m` |
+| `TRADING_REGIME_TIMEFRAME` | Timeframe used for regime detection | `4h` |
+| `TRADING_TIMEFRAME` | Trading timeframe for signal generation | `1h` |
 | `TRADING_LEVERAGE` | Requested leverage setting. Coinbase Advanced Trade spot has no real leverage; this only scales how much USD is deployed per trade, so leave it at `1` unless you are certain your account supports margin | `1` |
 | `TRADING_RISK_PCT` | Total portfolio risk allocated across all tracked symbols | `0.20` |
-| `TRADING_CHECK_INTERVAL` | Seconds between cycles | `60` |
+| `TRADING_CHECK_INTERVAL` | Seconds between cycles | `300` |
 | `TRADING_COOLDOWN_MINUTES` | Cooldown after exits | `5` |
 | `TRADING_MIN_ORDER_SIZE` | Skip entries below this USD value | `1.00` |
-| `TRADING_USE_LIMIT_ORDERS` | Use limit entries/exits with market fallback | `false` |
+| `TRADING_USE_LIMIT_ORDERS` | Use limit entries/exits with market fallback | `true` |
+| `TRADING_MAX_OPEN_POSITIONS` | Max concurrent open positions | `2` |
+| `TRADING_MAX_TRADES_PER_SYMBOL_PER_DAY` | Max new entries per coin per UTC day | `2` |
+| `TRADING_DAILY_PROFIT_TARGET_USD` | Halt new entries after this realized P/L; open positions can still exit (`0` disables) | `100` |
 | `TRADING_LOG_SIGNAL_CHECKS` | Record blocked-entry reasons | `true` |
 | `TRADING_PORTFOLIO_SNAPSHOT_MINUTES` | Minutes between account snapshots | `30` |
 | `TRADING_JOURNAL_ENABLED` | Enable structured event logging | `true` |
@@ -346,7 +349,11 @@ APP_ROLE=bot
 BOT_EXECUTE=true
 COINBASE_API_KEY=...
 COINBASE_API_SECRET=...
-TRADING_SYMBOLS=ETH/USD,BTC/USD,LINK/USD,SHIB/USD,ALGO/USD,FET/USD
+TRADING_SYMBOLS=ETH/USD,BTC/USD,LINK/USD
+TRADING_TIMEFRAME=1h
+TRADING_REGIME_TIMEFRAME=4h
+TRADING_USE_LIMIT_ORDERS=true
+TRADING_DAILY_PROFIT_TARGET_USD=100
 TRADING_LEVERAGE=1
 TRADING_RISK_PCT=0.20
 TRADING_JOURNAL_ENABLED=true
