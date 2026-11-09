@@ -15,7 +15,14 @@ import pandas_ta_classic as ta
 from dotenv import load_dotenv
 
 from portfolio_utils import fetch_portfolio_snapshot
-from position_sync import ExitBackoff, balance_amounts, place_exit_order, reconcile_action
+from position_sync import (
+    EXIT_NOTHING_TO_SELL,
+    EXIT_SOLD,
+    ExitBackoff,
+    balance_amounts,
+    place_exit_order,
+    reconcile_action,
+)
 from risk_limits import (
     compute_position_size,
     current_day_key,
@@ -225,7 +232,6 @@ def place_entry_order(
                 return True, filled, average
             # Do not leave the buy resting: it locks USD and can fill later without the
             # bot knowing, leaving an untracked position. Cancel, then keep any partial fill.
-            try:
             cancelled = False
             try:
                 exchange.cancel_order(order.get("id"), symbol)
@@ -1077,7 +1083,7 @@ while True:
                     )
                     continue
 
-                exit_executed = place_exit_order(
+                exit_result = place_exit_order(
                     exchange,
                     symbol,
                     base_currency,
@@ -1089,7 +1095,23 @@ while True:
                     # A breached stop always exits at market, whatever the trigger.
                     force_market=stop_hit,
                 )
-                if exit_executed:
+                if exit_result == EXIT_NOTHING_TO_SELL:
+                    # The coins were sold or moved outside the bot (or only dust is left).
+                    # Close the tracked position, but no sale happened here, so record no P&L.
+                    exit_backoff.record_success(symbol)
+                    journal.log_event(
+                        "position_closed_without_sale",
+                        symbol=symbol,
+                        profile=profile_name,
+                        regime=regime_label,
+                        reason=exit_reason,
+                        status="closed",
+                        price=price,
+                        amount=pos["position_amount"],
+                        payload={"note": "no sellable balance; no realized P&L recorded"},
+                    )
+                    reset_position_state(pos, record_exit=True)
+                elif exit_result == EXIT_SOLD:
                     exit_backoff.record_success(symbol)
                     estimated_pnl = (price - entry_price) * pos["position_amount"]
                     exit_payload["estimated_pnl_usd"] = estimated_pnl

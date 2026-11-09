@@ -6,6 +6,9 @@ Run with:  python -m unittest test_position_sync    (no network, no extra depend
 import unittest
 
 from position_sync import (
+    EXIT_FAILED,
+    EXIT_NOTHING_TO_SELL,
+    EXIT_SOLD,
     ExitBackoff,
     balance_amounts,
     cancel_open_orders,
@@ -94,37 +97,53 @@ class StuckOrderRegressionTests(unittest.TestCase):
         ex.add_resting_sell(1.03215358, price=2800.0)  # stale order far above market
         self.assertEqual(ex.fetch_balance()["ETH"]["free"], 0.0)
 
-        closed = place_exit_order(
+        result = place_exit_order(
             ex, "ETH/USD", "ETH", 1.02999464, "Stop-loss",
             use_limit_orders=True, limit_order_offset_pct=0.001,
             enable_trading=True, force_market=True, sleep=no_sleep,
         )
 
-        self.assertTrue(closed)
+        self.assertEqual(result, EXIT_SOLD)
         self.assertIn("old-1", ex.cancelled)
         self.assertEqual(len(ex.market_sells), 1)
         self.assertAlmostEqual(ex.market_sells[0], 1.02999464, places=8)
 
     def test_unfilled_limit_exit_is_cancelled_then_sold_at_market(self):
         ex = FakeExchange(total=0.5, limit_fills=False)
-        closed = place_exit_order(
+        result = place_exit_order(
             ex, "ETH/USD", "ETH", 0.5, "Profit-taking",
             use_limit_orders=True, limit_order_offset_pct=0.001,
             enable_trading=True, sleep=no_sleep,
         )
-        self.assertTrue(closed)
+        self.assertEqual(result, EXIT_SOLD)
         # The bot's own limit order must not be left resting on the book.
         self.assertEqual([o for o in ex.orders.values() if o["status"] == "open"], [])
         self.assertEqual(ex.market_sells, [0.5])
 
     def test_filled_limit_exit_does_not_also_market_sell(self):
         ex = FakeExchange(total=0.5, limit_fills=True)
-        closed = place_exit_order(
+        result = place_exit_order(
             ex, "ETH/USD", "ETH", 0.5, "Profit-taking",
             use_limit_orders=True, limit_order_offset_pct=0.001,
             enable_trading=True, sleep=no_sleep,
         )
-        self.assertTrue(closed)
+        self.assertEqual(result, EXIT_SOLD)
+        self.assertEqual(ex.market_sells, [])
+
+    def test_limit_exit_that_cannot_be_cancelled_is_a_failure(self):
+        ex = FakeExchange(total=0.5, limit_fills=False)
+
+        def refuse(order_id, symbol):
+            raise RuntimeError("cancel rejected")
+
+        ex.cancel_order = refuse
+        result = place_exit_order(
+            ex, "ETH/USD", "ETH", 0.5, "Profit-taking",
+            use_limit_orders=True, limit_order_offset_pct=0.001,
+            enable_trading=True, sleep=no_sleep,
+        )
+        # The order is still resting and holding the ETH: not sold, not closed.
+        self.assertEqual(result, EXIT_FAILED)
         self.assertEqual(ex.market_sells, [])
 
 
@@ -134,19 +153,22 @@ class PlaceExitOrderTests(unittest.TestCase):
         place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep)
         self.assertEqual(ex.market_sells, [0.9])
 
-    def test_zero_balance_is_treated_as_closed_not_retried(self):
+    def test_zero_balance_closes_without_a_sale(self):
         ex = FakeExchange(total=0.0)
-        self.assertTrue(place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep))
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_NOTHING_TO_SELL)
         self.assertEqual(ex.market_sells, [])
 
-    def test_dust_below_exchange_minimum_counts_as_closed(self):
+    def test_dust_below_exchange_minimum_closes_without_a_sale(self):
         ex = FakeExchange(total=0.00001, min_amount=0.0001)
-        self.assertTrue(place_exit_order(ex, "ETH/USD", "ETH", 0.5, "Stop-loss", False, 0.0, True, sleep=no_sleep))
+        result = place_exit_order(ex, "ETH/USD", "ETH", 0.5, "Stop-loss", False, 0.0, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_NOTHING_TO_SELL)
         self.assertEqual(ex.market_sells, [])
 
     def test_simulated_mode_places_nothing(self):
         ex = FakeExchange(total=1.0)
-        self.assertTrue(place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", True, 0.0, False, sleep=no_sleep))
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", True, 0.0, False, sleep=no_sleep)
+        self.assertEqual(result, EXIT_SOLD)
         self.assertEqual(ex.market_sells, [])
         self.assertEqual(ex.orders, {})
 
@@ -157,7 +179,8 @@ class PlaceExitOrderTests(unittest.TestCase):
             raise RuntimeError("network down")
 
         ex.fetch_balance = boom
-        self.assertFalse(place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep))
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_FAILED)
 
 
 class CancelOpenOrdersTests(unittest.TestCase):
@@ -167,6 +190,13 @@ class CancelOpenOrdersTests(unittest.TestCase):
         ex.orders["buy-1"] = {"id": "buy-1", "side": "buy", "amount": 0.1, "price": 1500.0, "status": "open"}
         self.assertEqual(cancel_open_orders(ex, "ETH/USD", side="sell"), 1)
         self.assertEqual(ex.orders["buy-1"]["status"], "open")
+
+    def test_skips_orders_for_other_symbols(self):
+        ex = FakeExchange(total=1.0)
+        ex.orders["btc-1"] = {"id": "btc-1", "symbol": "BTC/USD", "side": "sell",
+                              "amount": 0.01, "price": 90000.0, "status": "open"}
+        self.assertEqual(cancel_open_orders(ex, "ETH/USD"), 0)
+        self.assertEqual(ex.orders["btc-1"]["status"], "open")
 
     def test_listing_failure_is_non_fatal(self):
         ex = FakeExchange()

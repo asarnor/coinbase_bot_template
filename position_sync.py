@@ -22,6 +22,13 @@ Everything here takes the exchange as a parameter so it can be tested with a fak
 import time
 from typing import Dict, Optional, Tuple
 
+# Outcomes of place_exit_order. Only EXIT_SOLD means a sell actually executed (or was
+# simulated); EXIT_NOTHING_TO_SELL means the position is gone but nothing was sold, so
+# callers must not record realized P&L for it.
+EXIT_SOLD = "sold"
+EXIT_NOTHING_TO_SELL = "nothing_to_sell"
+EXIT_FAILED = "failed"
+
 
 def balance_amounts(balance: Dict, currency: str) -> Tuple[float, float]:
     """Return (free, total) for a currency from a ccxt balance dict; 0.0 when missing."""
@@ -99,15 +106,15 @@ def place_exit_order(
     force_market: bool = False,
     fill_wait_seconds: float = 5.0,
     sleep=time.sleep,
-) -> bool:
-    """Sell up to `amount` of `symbol`. Returns True when the position is closed.
+) -> str:
+    """Sell up to `amount` of `symbol` and return EXIT_SOLD, EXIT_NOTHING_TO_SELL or EXIT_FAILED.
 
-    "Closed" also covers the case where only dust below the exchange minimum is left,
-    so the bot does not retry an unsellable remainder forever.
+    EXIT_NOTHING_TO_SELL covers a zero balance or dust below the exchange minimum: the
+    position should be closed (so the bot stops retrying), but no sale happened.
     """
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True
+        return EXIT_SOLD
 
     # 1. Free anything an old order is holding.
     cancel_open_orders(exchange, symbol)
@@ -116,16 +123,16 @@ def place_exit_order(
     #    never fall back to the tracked amount (that is what produced INSUFFICIENT_FUND).
     free = _free_base(exchange, base_currency)
     if free is None:
-        return False
+        return EXIT_FAILED
     sell_amount = _to_precision(exchange, symbol, min(amount, free))
     dust = min_trade_amount(exchange, symbol)
 
     if sell_amount <= 0 or (dust and sell_amount < dust):
         print(
             f"[{base_currency}] ⚠️  Nothing sellable for {reason} "
-            f"(free={free}, tracked={amount}). Treating position as closed."
+            f"(free={free}, tracked={amount}). Closing the position without a sale."
         )
-        return True
+        return EXIT_NOTHING_TO_SELL
 
     # 3. Optional limit exit; cancel it if it does not fill so it cannot lock the coins.
     if use_limit_orders and not force_market:
@@ -140,33 +147,49 @@ def place_exit_order(
             status = exchange.fetch_order(order_id, symbol) if order_id else {}
             if status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit exit filled")
-                return True
+                return EXIT_SOLD
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
+        limit_filled = 0.0
         if order_id:
             try:
                 exchange.cancel_order(order_id, symbol)
                 print(f"[{base_currency}] 🧹 Cancelled unfilled limit exit {order_id}; falling back to market")
             except Exception as exc:
-                # It may have filled between the check and the cancel; the balance re-check handles it.
+                # It may have filled between the check and the cancel; the status check decides.
                 print(f"[{base_currency}] ⚠️  Could not cancel limit exit {order_id}: {exc}")
+            try:
+                final = exchange.fetch_order(order_id, symbol) or {}
+            except Exception as exc:
+                print(f"[{base_currency}] ⚠️  Could not confirm limit exit {order_id}: {exc}")
+                return EXIT_FAILED
+            if final.get("status") == "closed":
+                print(f"[{base_currency}] ✅ Limit exit filled before cancel; position closed")
+                return EXIT_SOLD
+            if final.get("status") == "open":
+                # Cancel failed and the order is still resting, holding the coins. Retry later.
+                return EXIT_FAILED
+            limit_filled = float(final.get("filled") or 0.0)
 
         free = _free_base(exchange, base_currency)
         if free is None:
-            return False
+            return EXIT_FAILED
         sell_amount = _to_precision(exchange, symbol, min(amount, free))
         if sell_amount <= 0 or (dust and sell_amount < dust):
-            print(f"[{base_currency}] ✅ Limit exit filled before cancel; position closed")
-            return True
+            if limit_filled > 0:
+                print(f"[{base_currency}] ✅ Limit exit partially filled; remainder is dust. Position closed")
+                return EXIT_SOLD
+            print(f"[{base_currency}] ⚠️  Nothing left to sell after cancelling the limit exit")
+            return EXIT_NOTHING_TO_SELL
 
     # 4. Market sell whatever is still free.
     try:
         order = exchange.create_market_sell_order(symbol, sell_amount)
         print(f"[{base_currency}] ✅ {reason} market sell executed: {order.get('id', 'N/A')}")
-        return True
+        return EXIT_SOLD
     except Exception as exc:
         print(f"[{base_currency}] ❌ {reason} sell failed: {exc}")
-        return False
+        return EXIT_FAILED
 
 
 def reconcile_action(
