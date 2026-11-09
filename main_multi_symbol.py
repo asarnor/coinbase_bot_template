@@ -226,16 +226,25 @@ def place_entry_order(
             # Do not leave the buy resting: it locks USD and can fill later without the
             # bot knowing, leaving an untracked position. Cancel, then keep any partial fill.
             try:
+            cancelled = False
+            try:
                 exchange.cancel_order(order.get("id"), symbol)
-                order_status = exchange.fetch_order(order.get("id"), symbol)
+                cancelled = True
             except Exception as cancel_exc:
                 print(f"[{base_currency}] ⚠️  Could not cancel unfilled limit buy: {cancel_exc}")
+            try:
+                order_status = exchange.fetch_order(order.get("id"), symbol)
+            except Exception:
+                pass
             partial = float(order_status.get("filled") or 0.0)
             if partial > 0:
                 average = float(order_status.get("average") or limit_price)
                 print(f"[{base_currency}] ✅ Limit buy partially filled ({partial}); tracking the filled amount")
                 return True, partial, average
-            print(f"[{base_currency}] 🧹 Limit buy did not fill; cancelled. Will re-evaluate next cycle")
+            if cancelled:
+                print(f"[{base_currency}] 🧹 Limit buy did not fill; cancelled. Will re-evaluate next cycle")
+            else:
+                print(f"[{base_currency}] ⏳ Limit buy still open (cancel failed). Will re-evaluate next cycle")
             return False, 0.0, 0.0
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
