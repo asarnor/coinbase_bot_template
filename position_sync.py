@@ -43,6 +43,8 @@ def cancel_open_orders(exchange, symbol: str, side: Optional[str] = None) -> int
 
     cancelled = 0
     for order in open_orders:
+        if order.get("symbol") and order.get("symbol") != symbol:
+            continue
         if side and order.get("side") != side:
             continue
         order_id = order.get("id")
