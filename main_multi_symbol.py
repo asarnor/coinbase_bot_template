@@ -20,6 +20,7 @@ from position_sync import (
     EXIT_SOLD,
     ExitBackoff,
     balance_amounts,
+    coinbase_exchange_options,
     place_exit_order,
     reconcile_action,
 )
@@ -585,9 +586,8 @@ try:
         "secret": api_secret,
         "enableRateLimit": True,
         "sandbox": use_sandbox,
-        "options": {
-            "createMarketBuyOrderRequiresPrice": False,
-        },
+        # Includes fetchBalance=v3 so holds are not reported as free (see position_sync).
+        "options": coinbase_exchange_options(),
     }
 
     if use_sandbox:

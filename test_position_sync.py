@@ -12,6 +12,7 @@ from position_sync import (
     ExitBackoff,
     balance_amounts,
     cancel_open_orders,
+    coinbase_exchange_options,
     place_exit_order,
     reconcile_action,
 )
@@ -24,9 +25,12 @@ class InsufficientFunds(Exception):
 class FakeExchange:
     """Tiny Coinbase-like spot exchange: resting sell orders put the base coin on hold."""
 
-    def __init__(self, base="ETH", total=1.0, price=2000.0, min_amount=0.0001, limit_fills=False):
+    def __init__(self, base="ETH", total=1.0, price=2000.0, min_amount=0.0001, limit_fills=False,
+                 external_hold=0.0):
         self.base = base
         self.total = total
+        # Coins Coinbase holds for reasons the bot cannot cancel (staking, transfers, locks).
+        self.external_hold = external_hold
         self.price = price
         self.limit_fills = limit_fills
         self.orders = {}
@@ -37,7 +41,8 @@ class FakeExchange:
 
     # --- helpers -------------------------------------------------------------
     def _held(self):
-        return sum(o["amount"] for o in self.orders.values() if o["status"] == "open" and o["side"] == "sell")
+        orders = sum(o["amount"] for o in self.orders.values() if o["status"] == "open" and o["side"] == "sell")
+        return orders + self.external_hold
 
     def add_resting_sell(self, amount, price):
         order_id = f"old-{self.next_id}"
@@ -181,6 +186,54 @@ class PlaceExitOrderTests(unittest.TestCase):
         ex.fetch_balance = boom
         result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep)
         self.assertEqual(result, EXIT_FAILED)
+
+
+class HoldsAndBalanceSourceTests(unittest.TestCase):
+    """Nov 10 2026 follow-up: ETH on hold outside the bot's own orders."""
+
+    def test_exchange_options_read_balances_from_v3(self):
+        options = coinbase_exchange_options()
+        self.assertEqual(options["fetchBalance"], "v3PrivateGetBrokerageAccounts")
+        self.assertFalse(options["createMarketBuyOrderRequiresPrice"])
+        options["fetchBalance"] = "changed"  # callers get a copy, not the shared dict
+        self.assertEqual(coinbase_exchange_options()["fetchBalance"], "v3PrivateGetBrokerageAccounts")
+
+    def test_coins_fully_on_hold_keep_the_position_and_fail(self):
+        ex = FakeExchange(total=1.03215357, external_hold=1.03215357)
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.03215357, "Stop-loss", False, 0.0, True,
+                                  force_market=True, sleep=no_sleep)
+        # Not closed without a sale (the coins are still there) and no doomed order sent.
+        self.assertEqual(result, EXIT_FAILED)
+        self.assertEqual(ex.market_sells, [])
+
+    def test_partial_hold_sells_only_the_free_part(self):
+        ex = FakeExchange(total=1.0, external_hold=0.4)
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_SOLD)
+        self.assertEqual(len(ex.market_sells), 1)
+        self.assertAlmostEqual(ex.market_sells[0], 0.6, places=8)
+
+    def test_hold_found_after_cancelling_limit_exit_keeps_position(self):
+        ex = FakeExchange(total=0.5, limit_fills=False)
+
+        def cancel_then_lock(order_id, symbol):
+            FakeExchange.cancel_order(ex, order_id, symbol)
+            ex.external_hold = 0.5  # e.g. the coins were moved into staking meanwhile
+
+        ex.cancel_order = cancel_then_lock
+        result = place_exit_order(ex, "ETH/USD", "ETH", 0.5, "Profit-taking",
+                                  use_limit_orders=True, limit_order_offset_pct=0.001,
+                                  enable_trading=True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_FAILED)
+        self.assertEqual(ex.market_sells, [])
+
+    def test_v2_style_balance_that_overstates_free_still_fails_safely(self):
+        """If balances ever come from v2 again (free == total), the rejection is a failure, not a close."""
+        ex = FakeExchange(total=1.0, external_hold=1.0)
+        ex.fetch_balance = lambda: {"ETH": {"free": 1.0, "used": 0.0, "total": 1.0}}
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_FAILED)
+        self.assertEqual(ex.market_sells, [])
 
 
 class CancelOpenOrdersTests(unittest.TestCase):
