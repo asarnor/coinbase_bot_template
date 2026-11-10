@@ -8,6 +8,8 @@ from typing import Dict, List, Optional
 import ccxt
 from dotenv import load_dotenv
 
+from position_sync import coinbase_exchange_options
+
 
 def load_exchange_from_env(use_sandbox: bool = False):
     load_dotenv()
@@ -45,9 +47,8 @@ def load_exchange_from_env(use_sandbox: bool = False):
         "secret": api_secret,
         "enableRateLimit": True,
         "sandbox": use_sandbox,
-        "options": {
-            "createMarketBuyOrderRequiresPrice": False,
-        },
+        # Includes fetchBalance=v3 so holds are not reported as free (see position_sync).
+        "options": coinbase_exchange_options(),
     }
     if use_sandbox:
         config["password"] = api_passphrase if api_passphrase else ""

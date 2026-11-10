@@ -18,6 +18,15 @@ This module fixes that class of problem:
 * ``ExitBackoff`` stops a failing exit from hammering the API every cycle.
 
 Everything here takes the exchange as a parameter so it can be tested with a fake.
+
+Follow-up (Nov 10 2026): ccxt's Coinbase class reads balances from the v2 /accounts
+endpoint by default, and its v2 parser sets ``free = total``. Coins Coinbase holds
+(open orders, pending transfers, staking or other locks) therefore still looked free,
+so the sizing above did not help and the ETH stop-loss kept failing with
+INSUFFICIENT_FUND. ``COINBASE_EXCHANGE_OPTIONS`` switches ccxt to the Advanced Trade
+v3 accounts endpoint, which reports ``available_balance`` (free) and ``hold`` (used)
+separately. ``place_exit_order`` also no longer closes a position whose coins are
+merely on hold; it reports the hold and retries later.
 """
 import time
 from typing import Dict, Optional, Tuple
@@ -28,6 +37,18 @@ from typing import Dict, Optional, Tuple
 EXIT_SOLD = "sold"
 EXIT_NOTHING_TO_SELL = "nothing_to_sell"
 EXIT_FAILED = "failed"
+
+# ccxt options for the Coinbase exchange. ``fetchBalance`` must use the v3 Advanced Trade
+# accounts endpoint: the ccxt default (v2) reports every coin as free, holds included.
+COINBASE_EXCHANGE_OPTIONS = {
+    "createMarketBuyOrderRequiresPrice": False,
+    "fetchBalance": "v3PrivateGetBrokerageAccounts",
+}
+
+
+def coinbase_exchange_options() -> Dict:
+    """A fresh copy of the ccxt options this bot uses for Coinbase (e.g. main_multi_symbol.py, portfolio_utils.py)."""
+    return dict(COINBASE_EXCHANGE_OPTIONS)
 
 
 def balance_amounts(balance: Dict, currency: str) -> Tuple[float, float]:
@@ -78,13 +99,36 @@ def min_trade_amount(exchange, symbol: str) -> float:
         return 0.0
 
 
-def _free_base(exchange, base_currency: str) -> Optional[float]:
+def _base_balance(exchange, base_currency: str) -> Optional[Tuple[float, float]]:
+    """(free, total) of the base coin, or None when the balance cannot be fetched."""
     try:
-        free, _ = balance_amounts(exchange.fetch_balance(), base_currency)
-        return free
+        return balance_amounts(exchange.fetch_balance(), base_currency)
     except Exception as exc:
         print(f"[{base_currency}] ⚠️  Could not fetch balance: {exc}")
         return None
+
+
+def _nothing_free_result(base_currency: str, reason: str, free: float, total: float,
+                         amount: float, dust: float, context: str) -> str:
+    """Decide what an exit with no sellable balance means.
+
+    Coins that are still in the account but on hold (an order or lock the bot could not
+    cancel, a pending transfer, staking) are not gone: keep the position and retry later.
+    Only a real zero or dust balance closes the position without a sale.
+    """
+    on_hold = max(total - free, 0.0)
+    if on_hold > 0 and (not dust or on_hold >= dust):
+        print(
+            f"[{base_currency}] ⛔ {reason} blocked: {on_hold:.8f} {base_currency} is on hold at "
+            f"Coinbase (free={free:.8f}, total={total:.8f}, tracked={amount:.8f}). Release the hold "
+            f"(open order, transfer or staking) in Coinbase; the bot will retry."
+        )
+        return EXIT_FAILED
+    print(
+        f"[{base_currency}] ⚠️  {context} for {reason} "
+        f"(free={free}, tracked={amount}). Closing the position without a sale."
+    )
+    return EXIT_NOTHING_TO_SELL
 
 
 def _to_precision(exchange, symbol: str, amount: float) -> float:
@@ -121,18 +165,15 @@ def place_exit_order(
 
     # 2. Size from the FREE balance. A missing/zero balance means there is nothing to sell;
     #    never fall back to the tracked amount (that is what produced INSUFFICIENT_FUND).
-    free = _free_base(exchange, base_currency)
-    if free is None:
+    bal = _base_balance(exchange, base_currency)
+    if bal is None:
         return EXIT_FAILED
+    free, total = bal
     sell_amount = _to_precision(exchange, symbol, min(amount, free))
     dust = min_trade_amount(exchange, symbol)
 
     if sell_amount <= 0 or (dust and sell_amount < dust):
-        print(
-            f"[{base_currency}] ⚠️  Nothing sellable for {reason} "
-            f"(free={free}, tracked={amount}). Closing the position without a sale."
-        )
-        return EXIT_NOTHING_TO_SELL
+        return _nothing_free_result(base_currency, reason, free, total, amount, dust, "Nothing sellable")
 
     # 3. Optional limit exit; cancel it if it does not fill so it cannot lock the coins.
     if use_limit_orders and not force_market:
@@ -171,16 +212,19 @@ def place_exit_order(
                 return EXIT_FAILED
             limit_filled = float(final.get("filled") or 0.0)
 
-        free = _free_base(exchange, base_currency)
-        if free is None:
+        bal = _base_balance(exchange, base_currency)
+        if bal is None:
             return EXIT_FAILED
+        free, total = bal
         sell_amount = _to_precision(exchange, symbol, min(amount, free))
         if sell_amount <= 0 or (dust and sell_amount < dust):
             if limit_filled > 0:
                 print(f"[{base_currency}] ✅ Limit exit partially filled; remainder is dust. Position closed")
                 return EXIT_SOLD
-            print(f"[{base_currency}] ⚠️  Nothing left to sell after cancelling the limit exit")
-            return EXIT_NOTHING_TO_SELL
+            return _nothing_free_result(
+                base_currency, reason, free, total, amount, dust,
+                "Nothing left to sell after cancelling the limit exit",
+            )
 
     # 4. Market sell whatever is still free.
     try:
@@ -189,6 +233,14 @@ def place_exit_order(
         return EXIT_SOLD
     except Exception as exc:
         print(f"[{base_currency}] ❌ {reason} sell failed: {exc}")
+        if "INSUFFICIENT_FUND" in str(exc):
+            # Log what Coinbase reports right now, so a mismatch is visible in the logs.
+            after = _base_balance(exchange, base_currency)
+            if after is not None:
+                print(
+                    f"[{base_currency}]    Balance after rejection: free={after[0]:.8f}, "
+                    f"total={after[1]:.8f}, attempted={sell_amount:.8f}"
+                )
         return EXIT_FAILED
 
 
