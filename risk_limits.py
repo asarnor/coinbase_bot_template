@@ -336,7 +336,8 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 def restore_open_positions_from_events(events: List[Dict]) -> Dict[str, Dict]:
     """Replay journaled fills and return still-open bot positions keyed by symbol.
 
-    `entry_executed` opens a position. `exit_executed`, `position_closed_without_sale`
+    `entry_executed` opens a position (only live fills, `status == "executed"`;
+    simulated dry-run fills are ignored). `exit_executed`, `position_closed_without_sale`
     and a `position_synced` "clear" close it; a `position_synced` "resize" updates its
     amount. Startup balance reconciliations are ignored so a previous mark-price
     estimate cannot be treated as a real entry on the next restart.
@@ -346,6 +347,9 @@ def restore_open_positions_from_events(events: List[Dict]) -> Dict[str, Dict]:
         event_type = event.get("event_type")
         symbol = event.get("symbol")
         if not symbol:
+            continue
+        if event_type in ("entry_executed", "exit_executed") and (event.get("status") or "executed") != "executed":
+            # Simulated (dry-run) fills never touched the exchange.
             continue
         if event_type == "entry_executed":
             open_positions[symbol] = {

@@ -523,6 +523,21 @@ class RestoreOpenPositionsTests(unittest.TestCase):
         self.assertAlmostEqual(restored["ETH/USD"]["amount"], 0.03)
         self.assertAlmostEqual(restored["ETH/USD"]["entry_price"], 3000)
 
+    def test_simulated_entries_are_not_restored(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "status": "simulated",
+             "price": 3000, "amount": 0.05},
+        ]
+        self.assertEqual(restore_open_positions_from_events(events), {})
+
+    def test_simulated_exit_does_not_close_a_live_entry(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "status": "executed",
+             "price": 3000, "amount": 0.05},
+            {"event_type": "exit_executed", "symbol": "ETH/USD", "status": "simulated"},
+        ]
+        self.assertIn("ETH/USD", restore_open_positions_from_events(events))
+
     def test_sync_resize_without_an_entry_does_not_create_one(self):
         events = [{"event_type": "position_synced", "symbol": "ETH/USD", "status": "resize", "amount": 1.0}]
         self.assertEqual(restore_open_positions_from_events(events), {})
