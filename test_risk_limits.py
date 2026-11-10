@@ -325,6 +325,30 @@ class RestoreOpenPositionsTests(unittest.TestCase):
         ]
         self.assertEqual(restore_open_positions_from_events(events), {})
 
+    def test_close_without_sale_and_sync_clear_close_the_entry(self):
+        for closing in (
+            {"event_type": "position_closed_without_sale", "symbol": "ETH/USD"},
+            {"event_type": "position_synced", "symbol": "ETH/USD", "status": "clear", "amount": 0.0},
+        ):
+            events = [
+                {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.05},
+                closing,
+            ]
+            self.assertEqual(restore_open_positions_from_events(events), {}, closing)
+
+    def test_sync_resize_updates_the_amount(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.05},
+            {"event_type": "position_synced", "symbol": "ETH/USD", "status": "resize", "amount": 0.03},
+        ]
+        restored = restore_open_positions_from_events(events)
+        self.assertAlmostEqual(restored["ETH/USD"]["amount"], 0.03)
+        self.assertAlmostEqual(restored["ETH/USD"]["entry_price"], 3000)
+
+    def test_sync_resize_without_an_entry_does_not_create_one(self):
+        events = [{"event_type": "position_synced", "symbol": "ETH/USD", "status": "resize", "amount": 1.0}]
+        self.assertEqual(restore_open_positions_from_events(events), {})
+
 
 class PlanReconciledPositionTests(unittest.TestCase):
     def test_unknown_holdings_do_not_arm_a_stop(self):
@@ -443,6 +467,30 @@ class JournalLifecycleQueryTests(unittest.TestCase):
         self.assertEqual([row["event_type"] for row in rows], ["entry_executed", "exit_executed"])
         restored = restore_open_positions_from_events(rows)
         self.assertEqual(restored, {})
+
+    def test_lifecycle_query_limit_keeps_the_newest_events_in_order(self):
+        import os
+        import tempfile
+        import time as _time
+
+        from trading_journal import TradingJournal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "journal.db")
+            journal = TradingJournal(database_url=None, sqlite_path=path, enabled=True)
+            journal.log_event("entry_executed", symbol="ETH/USD", price=2800, amount=0.1)
+            _time.sleep(0.01)
+            journal.log_event("position_closed_without_sale", symbol="ETH/USD", amount=0.1)
+            _time.sleep(0.01)
+            journal.log_event("entry_executed", symbol="ETH/USD", price=3000, amount=0.04)
+            rows = journal.get_trade_lifecycle_events(limit=2)
+            journal.close()
+
+        self.assertEqual(
+            [row["event_type"] for row in rows],
+            ["position_closed_without_sale", "entry_executed"],
+        )
+        self.assertAlmostEqual(restore_open_positions_from_events(rows)["ETH/USD"]["entry_price"], 3000)
 
 
 def price_for(cost, amount):

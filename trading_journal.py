@@ -289,15 +289,18 @@ class TradingJournal:
         return rows[0] if rows else None
 
     def get_trade_lifecycle_events(self, limit: int = 5000) -> List[Dict[str, Any]]:
-        """Return journaled entries and exits in chronological order for restart restore."""
+        """Return the most recent position lifecycle events, oldest first, for restart restore."""
         token = self.param_token
         sql = (
             "SELECT * FROM bot_events "
-            "WHERE event_type IN ('entry_executed', 'exit_executed') "
-            "ORDER BY created_at ASC "
+            "WHERE event_type IN ('entry_executed', 'exit_executed', "
+            "'position_closed_without_sale', 'position_synced') "
+            "ORDER BY created_at DESC "
             f"LIMIT {token}"
         )
-        return self._rows_to_dicts(self._execute(sql, (limit,)))
+        rows = self._rows_to_dicts(self._execute(sql, (limit,)))
+        rows.reverse()
+        return rows
 
     def close(self) -> None:
         if self._conn is not None:

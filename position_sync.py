@@ -257,9 +257,13 @@ def reconcile_action(
 
     Returns one of:
       "clear"  - tracked as open, but the account holds less than `min_value_usd` of it
-      "resize" - tracked as open, but the held amount differs by more than `tolerance`
+      "resize" - tracked as open, but the account holds less than the tracked amount
+                 (by more than `tolerance`); the position shrinks to what is held
       "adopt"  - not tracked, the account holds a meaningful amount, and adoption is on
       "none"   - nothing to change
+
+    A tracked position is never resized UP: extra coins in the account (long-term
+    holdings, manual buys) belong to the owner, not to the bot's position.
     """
     held_value = held_total * price if price > 0 else 0.0
     meaningful = held_value >= max(min_value_usd, 0.0) and held_total > 0
@@ -269,7 +273,7 @@ def reconcile_action(
             return "clear"
         if tracked_amount <= 0:
             return "resize"
-        if abs(held_total - tracked_amount) / tracked_amount > tolerance:
+        if (tracked_amount - held_total) / tracked_amount > tolerance:
             return "resize"
         return "none"
 

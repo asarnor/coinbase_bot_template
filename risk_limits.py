@@ -228,9 +228,10 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 def restore_open_positions_from_events(events: List[Dict]) -> Dict[str, Dict]:
     """Replay journaled fills and return still-open bot positions keyed by symbol.
 
-    Only `entry_executed` / `exit_executed` events count. Startup balance
-    reconciliations are ignored so a previous mark-price estimate cannot be
-    treated as a real entry on the next restart.
+    `entry_executed` opens a position. `exit_executed`, `position_closed_without_sale`
+    and a `position_synced` "clear" close it; a `position_synced` "resize" updates its
+    amount. Startup balance reconciliations are ignored so a previous mark-price
+    estimate cannot be treated as a real entry on the next restart.
     """
     open_positions: Dict[str, Dict] = {}
     for event in events:
@@ -243,8 +244,18 @@ def restore_open_positions_from_events(events: List[Dict]) -> Dict[str, Dict]:
                 "entry_price": _safe_float(event.get("price")),
                 "amount": _safe_float(event.get("amount")),
             }
-        elif event_type == "exit_executed":
+        elif event_type in ("exit_executed", "position_closed_without_sale"):
             open_positions.pop(symbol, None)
+        elif event_type == "position_synced":
+            status = event.get("status")
+            if status == "clear":
+                open_positions.pop(symbol, None)
+            elif status == "resize" and symbol in open_positions:
+                amount = _safe_float(event.get("amount"))
+                if amount > 0:
+                    open_positions[symbol]["amount"] = amount
+                else:
+                    open_positions.pop(symbol, None)
     return open_positions
 
 
@@ -260,10 +271,10 @@ def plan_reconciled_position(
 ) -> Optional[Dict]:
     """Decide how to adopt an exchange balance after a bot restart.
 
-    Unknown-origin holdings (no journaled fill) are marked in-position so the
-    bot will not buy more of the same coin, but `manage_exits` is False. Arming
-    an ATR stop at mark price against the full wallet would sell long-term
-    BTC/ETH/etc. on the next small dip.
+    Unknown-origin holdings (no journaled fill) come back with `manage_exits`
+    False; the caller leaves them out of the bot's positions. Arming an ATR stop
+    at mark price against the full wallet would sell long-term BTC/ETH/etc. on
+    the next small dip.
 
     Journaled bot entries restore the recorded size (capped by what is actually
     held) and keep stop/profit management enabled.

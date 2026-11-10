@@ -377,8 +377,8 @@ def reconcile_open_positions(
     the bot may re-buy coins already held.
 
     Full-wallet mark-price ATR stops are unsafe: they treat long-term BTC/ETH bags
-    as bot inventory and can sell them on the next small dip. Only journaled
-    `entry_executed` fills are stop-managed. Other holdings block new buys only.
+    as bot inventory and can sell them on the next small dip. Only journaled bot
+    fills that are still open are restored; other holdings are left alone.
     """
     try:
         balance = exchange.fetch_balance()
@@ -426,19 +426,21 @@ def reconcile_open_positions(
         if planned is None:
             continue
 
-        pos = positions[symbol]
-        pos.update(planned)
         if planned["manage_exits"]:
+            positions[symbol].update(planned)
             print(
                 f"[{base_currency}] ♻️  Restored journaled position: "
                 f"{planned['position_amount']:.6f} @ {format_price(planned['entry_price'])} "
                 f"(held {held_amount:.6f}, ${usd_value:.2f})"
             )
         else:
+            # Holdings the bot did not buy are left out of its positions entirely: no
+            # stops, no targets, and they do not count toward max_open. The bot may still
+            # buy this coin; it then manages (and sells) only its own fill.
             print(
                 f"[{base_currency}] ♻️  Existing {held_amount:.6f} {base_currency} "
-                f"(${usd_value:.2f}) has no journaled entry. Blocking new buys and "
-                "NOT placing stops so long-term holdings are not sold."
+                f"(${usd_value:.2f}) has no journaled bot entry. Leaving it alone "
+                "(no stops or targets)."
             )
         journal.log_event(
             "position_reconciled",
@@ -454,7 +456,7 @@ def reconcile_open_positions(
                 "note": (
                     "restored from journaled fill"
                     if planned["manage_exits"]
-                    else "unknown-origin holding; exits disabled to avoid selling savings"
+                    else "unknown-origin holding; not managed by the bot"
                 ),
             },
         )

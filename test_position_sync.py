@@ -282,6 +282,10 @@ class ReconcileActionTests(unittest.TestCase):
     def test_large_difference_is_resized(self):
         self.assertEqual(reconcile_action(True, 1.0, 0.5, 2000.0, 5.0), "resize")
 
+    def test_extra_coins_in_account_never_grow_the_position(self):
+        # 0.05 ETH bought by the bot on top of a 1.0 ETH long-term holding.
+        self.assertEqual(reconcile_action(True, 0.05, 1.05, 2000.0, 5.0), "none")
+
     def test_untracked_holding_is_left_alone_by_default(self):
         self.assertEqual(reconcile_action(False, 0.0, 66.65, 10.25, 5.0), "none")
 
