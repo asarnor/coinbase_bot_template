@@ -278,14 +278,18 @@ class TradingJournal:
         rows = self._rows_to_dicts(self._execute(sql, (end_iso,)))
         return rows[0] if rows else None
 
-    def get_first_snapshot_after(self, start_iso: str) -> Optional[Dict[str, Any]]:
+    def get_first_snapshot_after(
+        self, start_iso: str, end_iso: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """First snapshot at or after `start_iso` (and before `end_iso`, when given)."""
         token = self.param_token
-        sql = (
-            "SELECT * FROM portfolio_snapshots "
-            f"WHERE created_at >= {token} "
-            "ORDER BY created_at ASC LIMIT 1"
-        )
-        rows = self._rows_to_dicts(self._execute(sql, (start_iso,)))
+        params: tuple = (start_iso,)
+        where = f"WHERE created_at >= {token} "
+        if end_iso is not None:
+            where += f"AND created_at < {token} "
+            params = (start_iso, end_iso)
+        sql = "SELECT * FROM portfolio_snapshots " + where + "ORDER BY created_at ASC LIMIT 1"
+        rows = self._rows_to_dicts(self._execute(sql, params))
         return rows[0] if rows else None
 
     def get_trade_lifecycle_events(self, limit: int = 5000) -> List[Dict[str, Any]]:

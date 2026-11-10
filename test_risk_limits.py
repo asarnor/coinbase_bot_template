@@ -627,6 +627,23 @@ class PlanReconciledPositionTests(unittest.TestCase):
 
 
 class JournalLifecycleQueryTests(unittest.TestCase):
+    def test_start_snapshot_lookup_stays_within_the_day(self):
+        import os
+        import tempfile
+
+        from trading_journal import TradingJournal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = TradingJournal(database_url=None, sqlite_path=os.path.join(tmp, "j.db"), enabled=True)
+            journal.log_portfolio_snapshot(total_estimated_usd=1234.0, free_usd=0.0, invested_usd=0.0, positions=[])
+            # A window entirely in the past must not pick up today's snapshot.
+            past = journal.get_first_snapshot_after("2000-01-01T00:00:00+00:00", "2000-01-02T00:00:00+00:00")
+            unbounded = journal.get_first_snapshot_after("2000-01-01T00:00:00+00:00")
+            journal.close()
+
+        self.assertIsNone(past)
+        self.assertIsNotNone(unbounded)
+
     def test_lifecycle_query_skips_non_fill_events(self):
         import os
         import tempfile

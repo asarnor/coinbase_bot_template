@@ -190,7 +190,12 @@ def place_exit_order(
             limit_price = last_price * (1 + limit_order_offset_pct)
             create_sent = True
             order = exchange.create_limit_sell_order(symbol, sell_amount, limit_price)
-            order_id = order.get("id")
+            order_id = order.get("id") if isinstance(order, dict) else None
+            if not order_id:
+                # Accepted but with no id to check or cancel: it may rest or fill, and a
+                # market sell on top of it could sell twice.
+                print(f"[{base_currency}] 🛑 Limit exit returned no order id; not sending a market sell.")
+                return EXIT_AMBIGUOUS
             print(f"[{base_currency}] ✅ {reason} limit order placed: {order_id} at ${limit_price:.6f}")
             sleep(fill_wait_seconds)
             status = exchange.fetch_order(order_id, symbol) if order_id else {}

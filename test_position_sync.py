@@ -267,6 +267,13 @@ class AmbiguousExitTests(unittest.TestCase):
         self.assertEqual(result, EXIT_AMBIGUOUS)
         self.assertEqual(ex.market_sells, [])
 
+    def test_limit_exit_without_an_order_id_is_ambiguous(self):
+        ex = FakeExchange(total=1.0)
+        ex.create_limit_sell_order = lambda symbol, amount, price: {}
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Profit-taking", True, 0.001, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_AMBIGUOUS)
+        self.assertEqual(ex.market_sells, [])
+
     def test_ticker_failure_before_any_order_is_not_ambiguous(self):
         ex = FakeExchange(total=1.0)
 

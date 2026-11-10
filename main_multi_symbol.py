@@ -382,8 +382,9 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
 
 
 def load_start_equity_from_journal(journal, day: str) -> float:
-    start_iso, _ = daily_utc_bounds(day)
-    snapshot = journal.get_first_snapshot_after(start_iso)
+    start_iso, end_iso = daily_utc_bounds(day)
+    # Bound to the same UTC day so a later day's snapshot is never used as this day's baseline.
+    snapshot = journal.get_first_snapshot_after(start_iso, end_iso)
     if not snapshot:
         return 0.0
 
