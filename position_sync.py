@@ -52,7 +52,7 @@ COINBASE_EXCHANGE_OPTIONS = {
 
 
 def coinbase_exchange_options() -> Dict:
-    """A fresh copy of the ccxt options every Coinbase exchange in this repo should use."""
+    """A fresh copy of the ccxt options this bot uses for Coinbase (e.g. main_multi_symbol.py, portfolio_utils.py)."""
     return dict(COINBASE_EXCHANGE_OPTIONS)
 
 
