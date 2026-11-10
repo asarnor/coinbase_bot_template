@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from portfolio_utils import fetch_portfolio_snapshot
 from position_sync import (
+    EXIT_AMBIGUOUS,
     EXIT_NOTHING_TO_SELL,
     EXIT_SOLD,
     ExitBackoff,
@@ -30,6 +31,7 @@ from risk_limits import (
     daily_utc_bounds,
     evaluate_entry_limits,
     extract_fill,
+    order_failure_is_ambiguous,
     plan_reconciled_position,
     record_realized_pnl,
     record_trade,
@@ -68,6 +70,31 @@ def reset_position_state(position: Dict, record_exit: bool = False) -> None:
     position["trailing_profit_target"] = 0.0
     position["breakeven_set"] = False
     position["manage_exits"] = True
+
+
+def halt_symbol_orders(position: Dict, journal, symbol: str, profile_name: str,
+                       regime_label: str, side: str, reason: str) -> None:
+    """Stop sending orders for this symbol until the bot restarts.
+
+    Used when a create-order call failed in a way that does not prove the exchange
+    rejected it: another buy or sell could double-fill. Check Coinbase, then restart.
+    """
+    position["orders_halted"] = True
+    base_currency = symbol.split("/")[0]
+    print(
+        f"[{base_currency}] 🛑 {reason} order result is uncertain. Halting further "
+        f"orders for {symbol} until restart; check Coinbase for the order."
+    )
+    journal.log_event(
+        "orders_halted",
+        symbol=symbol,
+        profile=profile_name,
+        regime=regime_label,
+        side=side,
+        reason=reason,
+        status="halted",
+        payload={"note": "create-order failed ambiguously; no further orders until restart"},
+    )
 
 
 def fetch_data(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
@@ -223,7 +250,13 @@ def place_entry_order(
     use_limit_orders: bool,
     limit_order_offset_pct: float,
     enable_trading: bool,
-) -> Tuple[bool, float, float]:
+) -> Tuple[bool, float, float, bool]:
+    """Return (executed, filled amount, average price, ambiguous).
+
+    `ambiguous` means a create-order call failed in a way that does not prove Coinbase
+    rejected it (timeout, dropped connection, 5xx); the caller must not send another
+    order for this symbol, because the first one may have filled.
+    """
     if use_limit_orders:
         limit_price = exchange.fetch_ticker(symbol)["last"] * (1 - limit_order_offset_pct)
         print(
@@ -232,7 +265,7 @@ def place_entry_order(
         )
         if not enable_trading:
             print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-            return True, amount, limit_price
+            return True, amount, limit_price, False
 
         try:
             order = exchange.create_limit_buy_order(symbol, amount, limit_price)
@@ -242,7 +275,7 @@ def place_entry_order(
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit order filled")
                 filled, average = extract_fill(order_status, amount, limit_price)
-                return True, filled, average
+                return True, filled, average, False
             # Do not leave the buy resting: it locks USD and can fill later without the
             # bot knowing, leaving an untracked position. Cancel, then keep any partial fill.
             cancelled = False
@@ -259,36 +292,40 @@ def place_entry_order(
             if partial > 0:
                 average = float(order_status.get("average") or limit_price)
                 print(f"[{base_currency}] ✅ Limit buy partially filled ({partial}); tracking the filled amount")
-                return True, partial, average
+                return True, partial, average, False
             if cancelled:
                 print(f"[{base_currency}] 🧹 Limit buy did not fill; cancelled. Will re-evaluate next cycle")
             else:
                 print(f"[{base_currency}] ⏳ Limit buy still open (cancel failed). Will re-evaluate next cycle")
-            return False, 0.0, 0.0
+            return False, 0.0, 0.0, False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
+            if order_failure_is_ambiguous(exc):
+                # The limit buy may exist (or have filled); a market buy now could double it.
+                print(f"[{base_currency}] 🛑 Not sending a market buy after an uncertain limit entry.")
+                return False, 0.0, 0.0, True
             try:
                 order = exchange.create_market_buy_order(symbol, cost)
                 print(f"[{base_currency}] ✅ Fallback market order executed: {order.get('id', 'N/A')}")
                 filled, average = extract_fill(order, amount, limit_price)
-                return True, filled, average
+                return True, filled, average, False
             except Exception as fallback_exc:
                 print(f"[{base_currency}] ❌ Market entry also failed: {fallback_exc}")
-                return False, 0.0, 0.0
+                return False, 0.0, 0.0, order_failure_is_ambiguous(fallback_exc)
 
     print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True, amount, 0.0
+        return True, amount, 0.0, False
 
     try:
         order = exchange.create_market_buy_order(symbol, cost)
         print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
         filled, average = extract_fill(order, amount, 0.0)
-        return True, filled, average
+        return True, filled, average, False
     except Exception as exc:
         print(f"[{base_currency}] ❌ Order failed: {exc}")
-        return False, 0.0, 0.0
+        return False, 0.0, 0.0, order_failure_is_ambiguous(exc)
 
 
 def get_regime_state(exchange, benchmark_symbols: List[str], regime_timeframe: str) -> Tuple[str, Dict[str, Dict]]:
@@ -736,6 +773,7 @@ for symbol in symbols:
         "peak_price": 0.0,
         "trailing_profit_target": 0.0,
         "last_exit_time": 0,
+        "orders_halted": False,
         "manage_exits": True,
     }
 
@@ -875,12 +913,17 @@ while True:
                 dynamic_spike_reversal *= profile["high_volatility_spike_scale"]
                 dynamic_atr_multiplier *= profile["high_volatility_atr_scale"]
 
+            position_label = (
+                "HALTED" if pos.get("orders_halted") else ("YES" if pos["in_position"] else "NO")
+            )
             print(
                 f"[{base_currency}] Price: {format_price(price)} | RSI: {rsi:.2f} | "
                 f"Stop: {format_price(pos['trailing_stop_price'])} | "
-                f"Position: {'YES' if pos['in_position'] else 'NO'} | "
+                f"Position: {position_label} | "
                 f"Profile: {profile_name}"
             )
+            if pos.get("orders_halted"):
+                continue
 
             if not pos["in_position"]:
                 current_time = time.time()
@@ -1016,7 +1059,7 @@ while True:
                         )
                         continue
 
-                    entry_executed, filled_amount, fill_price = place_entry_order(
+                    entry_executed, filled_amount, fill_price, entry_ambiguous = place_entry_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -1026,6 +1069,12 @@ while True:
                         limit_order_offset_pct,
                         enable_trading,
                     )
+
+                    if entry_ambiguous:
+                        halt_symbol_orders(
+                            pos, journal, symbol, profile_name, regime_label, "buy", "entry"
+                        )
+                        continue
 
                     if entry_executed:
                         effective_price = fill_price if fill_price and fill_price > 0 else price
@@ -1188,6 +1237,11 @@ while True:
                     # A breached stop always exits at market, whatever the trigger.
                     force_market=stop_hit,
                 )
+                if exit_result == EXIT_AMBIGUOUS:
+                    halt_symbol_orders(
+                        pos, journal, symbol, profile_name, regime_label, "sell", exit_reason
+                    )
+                    continue
                 if exit_result == EXIT_NOTHING_TO_SELL:
                     # The coins were sold or moved outside the bot (or only dust is left).
                     # Close the tracked position, but no sale happened here, so record no P&L.

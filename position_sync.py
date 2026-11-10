@@ -31,12 +31,17 @@ merely on hold; it reports the hold and retries later.
 import time
 from typing import Dict, Optional, Tuple
 
+from risk_limits import order_failure_is_ambiguous
+
 # Outcomes of place_exit_order. Only EXIT_SOLD means a sell actually executed (or was
 # simulated); EXIT_NOTHING_TO_SELL means the position is gone but nothing was sold, so
 # callers must not record realized P&L for it.
 EXIT_SOLD = "sold"
 EXIT_NOTHING_TO_SELL = "nothing_to_sell"
 EXIT_FAILED = "failed"
+# The sell request failed in a way that does not prove Coinbase rejected it (timeout,
+# dropped connection, 5xx). It may have filled, so the caller must not send another.
+EXIT_AMBIGUOUS = "ambiguous"
 
 # ccxt options for the Coinbase exchange. ``fetchBalance`` must use the v3 Advanced Trade
 # accounts endpoint: the ccxt default (v2) reports every coin as free, holds included.
@@ -151,7 +156,8 @@ def place_exit_order(
     fill_wait_seconds: float = 5.0,
     sleep=time.sleep,
 ) -> str:
-    """Sell up to `amount` of `symbol` and return EXIT_SOLD, EXIT_NOTHING_TO_SELL or EXIT_FAILED.
+    """Sell up to `amount` of `symbol`; return EXIT_SOLD, EXIT_NOTHING_TO_SELL, EXIT_FAILED
+    or EXIT_AMBIGUOUS.
 
     EXIT_NOTHING_TO_SELL covers a zero balance or dust below the exchange minimum: the
     position should be closed (so the bot stops retrying), but no sale happened.
@@ -178,9 +184,11 @@ def place_exit_order(
     # 3. Optional limit exit; cancel it if it does not fill so it cannot lock the coins.
     if use_limit_orders and not force_market:
         order_id = None
+        create_sent = False
         try:
             last_price = exchange.fetch_ticker(symbol)["last"]
             limit_price = last_price * (1 + limit_order_offset_pct)
+            create_sent = True
             order = exchange.create_limit_sell_order(symbol, sell_amount, limit_price)
             order_id = order.get("id")
             print(f"[{base_currency}] ✅ {reason} limit order placed: {order_id} at ${limit_price:.6f}")
@@ -191,6 +199,11 @@ def place_exit_order(
                 return EXIT_SOLD
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit exit failed: {exc}")
+            if create_sent and order_id is None and order_failure_is_ambiguous(exc):
+                # The create call itself failed uncertainly: there is no order id to
+                # check or cancel, and a market sell now could sell twice.
+                print(f"[{base_currency}] 🛑 Not sending a market sell after an uncertain limit exit.")
+                return EXIT_AMBIGUOUS
         limit_filled = 0.0
         if order_id:
             try:
@@ -233,6 +246,8 @@ def place_exit_order(
         return EXIT_SOLD
     except Exception as exc:
         print(f"[{base_currency}] ❌ {reason} sell failed: {exc}")
+        if order_failure_is_ambiguous(exc):
+            return EXIT_AMBIGUOUS
         if "INSUFFICIENT_FUND" in str(exc):
             # Log what Coinbase reports right now, so a mismatch is visible in the logs.
             after = _base_balance(exchange, base_currency)

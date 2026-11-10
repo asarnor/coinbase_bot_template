@@ -169,6 +169,44 @@ def resolve_effective_leverage(requested_leverage: float, setup_succeeded: bool)
     return max(requested_leverage, 1.0)
 
 
+# Exchange responses that mean "this attempt was rejected" and can be retried.
+# Timeouts, connection loss, and unreadable bodies are intentionally absent:
+# the order may already have been accepted.
+_DEFINITE_REJECTION_TYPES = frozenset(
+    {
+        "ExchangeError",
+        "RateLimitExceeded",
+        "DDoSProtection",
+        "InvalidNonce",
+    }
+)
+_AMBIGUOUS_SERVER_MARKERS = (
+    "internal_server_error",
+    "internal server error",
+)
+
+
+def order_failure_is_ambiguous(exc: BaseException) -> bool:
+    """True when a create-order exception may mean the order was still accepted.
+
+    Coinbase (via ccxt) raises ExchangeError subclasses (InsufficientFunds,
+    InvalidOrder, ...) for a rejected request, so that attempt did not trade and a
+    later retry is safe. Request timeouts, dropped connections, HTTP 5xx
+    (ExchangeNotAvailable) and unreadable bodies do not prove the order is absent;
+    retrying those can buy or sell again.
+    """
+    if exc is None:
+        return False
+
+    type_names = {cls.__name__ for cls in type(exc).__mro__}
+    message = str(exc).lower()
+    if any(marker in message for marker in _AMBIGUOUS_SERVER_MARKERS):
+        return True
+    if type_names & _DEFINITE_REJECTION_TYPES:
+        return False
+    return True
+
+
 def extract_fill(
     order: Optional[Dict], fallback_amount: float, fallback_price: float
 ) -> Tuple[float, float]:
