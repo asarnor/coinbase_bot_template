@@ -288,6 +288,17 @@ class TradingJournal:
         rows = self._rows_to_dicts(self._execute(sql, (start_iso,)))
         return rows[0] if rows else None
 
+    def get_trade_lifecycle_events(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        """Return journaled entries and exits in chronological order for restart restore."""
+        token = self.param_token
+        sql = (
+            "SELECT * FROM bot_events "
+            "WHERE event_type IN ('entry_executed', 'exit_executed') "
+            "ORDER BY created_at ASC "
+            f"LIMIT {token}"
+        )
+        return self._rows_to_dicts(self._execute(sql, (limit,)))
+
     def close(self) -> None:
         if self._conn is not None:
             try:
