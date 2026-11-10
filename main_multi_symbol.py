@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from portfolio_utils import fetch_portfolio_snapshot
 from position_sync import (
+    EXIT_AMBIGUOUS,
     EXIT_NOTHING_TO_SELL,
     EXIT_SOLD,
     ExitBackoff,
@@ -27,13 +28,17 @@ from position_sync import (
 from risk_limits import (
     compute_position_size,
     current_day_key,
+    daily_utc_bounds,
     evaluate_entry_limits,
     extract_fill,
-    new_daily_state,
+    order_failure_is_ambiguous,
+    plan_reconciled_position,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
-    symbol_loss_limit_hit,
+    resolve_effective_leverage,
+    restore_daily_state_from_events,
+    restore_open_positions_from_events,
 )
 from trading_journal import TradingJournal
 
@@ -64,6 +69,32 @@ def reset_position_state(position: Dict, record_exit: bool = False) -> None:
     position["peak_price"] = 0.0
     position["trailing_profit_target"] = 0.0
     position["breakeven_set"] = False
+    position["manage_exits"] = True
+
+
+def halt_symbol_orders(position: Dict, journal, symbol: str, profile_name: str,
+                       regime_label: str, side: str, reason: str) -> None:
+    """Stop sending orders for this symbol until the bot restarts.
+
+    Used when a create-order call failed in a way that does not prove the exchange
+    rejected it: another buy or sell could double-fill. Check Coinbase, then restart.
+    """
+    position["orders_halted"] = True
+    base_currency = symbol.split("/")[0]
+    print(
+        f"[{base_currency}] 🛑 {reason} order result is uncertain. Halting further "
+        f"orders for {symbol} until restart; check Coinbase for the order."
+    )
+    journal.log_event(
+        "orders_halted",
+        symbol=symbol,
+        profile=profile_name,
+        regime=regime_label,
+        side=side,
+        reason=reason,
+        status="halted",
+        payload={"note": "create-order failed ambiguously; no further orders until restart"},
+    )
 
 
 def fetch_data(exchange, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
@@ -89,6 +120,14 @@ def analyze_market(df: pd.DataFrame) -> pd.Series:
     # Use the last CLOSED candle (-2) rather than the still-forming candle (-1)
     # so signals do not repaint / flip within the current bar.
     return working.iloc[-2] if len(working) >= 2 else working.iloc[-1]
+
+
+def select_evaluation_price(
+    df: pd.DataFrame, signal_row: pd.Series, in_position: bool
+) -> float:
+    """Use stable closed-candle prices for entries and the latest price for exits."""
+    row = df.iloc[-1] if in_position else signal_row
+    return float(row["close"])
 
 
 def analyze_regime(df: pd.DataFrame) -> pd.Series:
@@ -211,7 +250,13 @@ def place_entry_order(
     use_limit_orders: bool,
     limit_order_offset_pct: float,
     enable_trading: bool,
-) -> Tuple[bool, float, float]:
+) -> Tuple[bool, float, float, bool]:
+    """Return (executed, filled amount, average price, ambiguous).
+
+    `ambiguous` means a create-order call failed in a way that does not prove Coinbase
+    rejected it (timeout, dropped connection, 5xx); the caller must not send another
+    order for this symbol, because the first one may have filled.
+    """
     if use_limit_orders:
         limit_price = exchange.fetch_ticker(symbol)["last"] * (1 - limit_order_offset_pct)
         print(
@@ -220,7 +265,7 @@ def place_entry_order(
         )
         if not enable_trading:
             print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-            return True, amount, limit_price
+            return True, amount, limit_price, False
 
         try:
             order = exchange.create_limit_buy_order(symbol, amount, limit_price)
@@ -230,7 +275,7 @@ def place_entry_order(
             if order_status.get("status") == "closed":
                 print(f"[{base_currency}] ✅ Limit order filled")
                 filled, average = extract_fill(order_status, amount, limit_price)
-                return True, filled, average
+                return True, filled, average, False
             # Do not leave the buy resting: it locks USD and can fill later without the
             # bot knowing, leaving an untracked position. Cancel, then keep any partial fill.
             cancelled = False
@@ -247,36 +292,40 @@ def place_entry_order(
             if partial > 0:
                 average = float(order_status.get("average") or limit_price)
                 print(f"[{base_currency}] ✅ Limit buy partially filled ({partial}); tracking the filled amount")
-                return True, partial, average
+                return True, partial, average, False
             if cancelled:
                 print(f"[{base_currency}] 🧹 Limit buy did not fill; cancelled. Will re-evaluate next cycle")
             else:
                 print(f"[{base_currency}] ⏳ Limit buy still open (cancel failed). Will re-evaluate next cycle")
-            return False, 0.0, 0.0
+            return False, 0.0, 0.0, False
         except Exception as exc:
             print(f"[{base_currency}] ❌ Limit entry failed: {exc}")
+            if order_failure_is_ambiguous(exc):
+                # The limit buy may exist (or have filled); a market buy now could double it.
+                print(f"[{base_currency}] 🛑 Not sending a market buy after an uncertain limit entry.")
+                return False, 0.0, 0.0, True
             try:
                 order = exchange.create_market_buy_order(symbol, cost)
                 print(f"[{base_currency}] ✅ Fallback market order executed: {order.get('id', 'N/A')}")
                 filled, average = extract_fill(order, amount, limit_price)
-                return True, filled, average
+                return True, filled, average, False
             except Exception as fallback_exc:
                 print(f"[{base_currency}] ❌ Market entry also failed: {fallback_exc}")
-                return False, 0.0, 0.0
+                return False, 0.0, 0.0, order_failure_is_ambiguous(fallback_exc)
 
     print(f"[{base_currency}] 🚀 ENTER LONG: Buying {amount:.6f} {base_currency} (Cost: ${cost:.2f})")
     if not enable_trading:
         print(f"[{base_currency}]    (Simulated - use --execute to enable real trading)")
-        return True, amount, 0.0
+        return True, amount, 0.0, False
 
     try:
         order = exchange.create_market_buy_order(symbol, cost)
         print(f"[{base_currency}] ✅ Order executed: {order.get('id', 'N/A')}")
         filled, average = extract_fill(order, amount, 0.0)
-        return True, filled, average
+        return True, filled, average, False
     except Exception as exc:
         print(f"[{base_currency}] ❌ Order failed: {exc}")
-        return False, 0.0, 0.0
+        return False, 0.0, 0.0, order_failure_is_ambiguous(exc)
 
 
 def get_regime_state(exchange, benchmark_symbols: List[str], regime_timeframe: str) -> Tuple[str, Dict[str, Dict]]:
@@ -332,6 +381,47 @@ def get_position_size(exchange, symbol: str, current_price: float, symbol_risk_s
         return 0, 0
 
 
+def load_start_equity_from_journal(journal, day: str) -> float:
+    start_iso, end_iso = daily_utc_bounds(day)
+    # Bound to the same UTC day so a later day's snapshot is never used as this day's baseline.
+    snapshot = journal.get_first_snapshot_after(start_iso, end_iso)
+    if not snapshot:
+        return 0.0
+
+    try:
+        return float(snapshot.get("total_estimated_usd") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def initialize_daily_state(exchange, journal, day: str) -> Dict:
+    start_iso, end_iso = daily_utc_bounds(day)
+    start_equity = load_start_equity_from_journal(journal, day)
+
+    if start_equity > 0:
+        print(f"🛡️ Restored start-of-day equity from journal: {format_price(start_equity)}")
+    else:
+        try:
+            snapshot = fetch_portfolio_snapshot(exchange)
+            start_equity = snapshot["total_estimated_usd"]
+            journal.log_portfolio_snapshot(
+                total_estimated_usd=snapshot["total_estimated_usd"],
+                free_usd=snapshot["free_usd"],
+                invested_usd=snapshot["invested_usd"],
+                positions=snapshot["positions"],
+            )
+        except Exception as exc:
+            journal.log_event(
+                "warning",
+                reason="initial_snapshot_failed",
+                status="warning",
+                payload={"message": str(exc)},
+            )
+
+    events = journal.get_events_between(start_iso, end_iso)
+    return restore_daily_state_from_events(day, events, start_equity)
+
+
 def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
     today = current_day_key()
     if today == state["day"]:
@@ -349,13 +439,10 @@ def roll_daily_state_if_needed(state: Dict, exchange, journal) -> None:
             "halted_symbols": [s for s, v in state["symbol_halted"].items() if v],
         },
     )
-    start_equity = state.get("start_equity_usd", 0.0)
-    try:
-        snap = fetch_portfolio_snapshot(exchange)
-        start_equity = snap["total_estimated_usd"]
-    except Exception:
-        pass
-    reset_daily_state(state, today, start_equity)
+    reset_daily_state(state, today, 0.0)
+    restored_state = initialize_daily_state(exchange, journal, today)
+    state.clear()
+    state.update(restored_state)
 
 
 def reconcile_open_positions(
@@ -371,14 +458,25 @@ def reconcile_open_positions(
     """Rebuild in-memory position state from existing exchange balances on startup.
 
     Without this, a restart forgets open positions, so their stops go unmanaged and
-    the bot may re-buy coins already held. Entry price is unknown after a restart, so
-    the current price is used as a best-effort proxy for stop/target placement.
+    the bot may re-buy coins already held.
+
+    Full-wallet mark-price ATR stops are unsafe: they treat long-term BTC/ETH bags
+    as bot inventory and can sell them on the next small dip. Only journaled bot
+    fills that are still open are restored; other holdings are left alone.
     """
     try:
         balance = exchange.fetch_balance()
     except Exception as exc:
         print(f"⚠️  Could not fetch balance for reconciliation: {exc}")
         return
+
+    journal_positions: Dict[str, Dict] = {}
+    try:
+        journal_positions = restore_open_positions_from_events(
+            journal.get_trade_lifecycle_events()
+        )
+    except Exception as exc:
+        print(f"⚠️  Could not restore journaled positions: {exc}")
 
     for symbol in symbols:
         base_currency = symbol.split("/")[0]
@@ -394,35 +492,57 @@ def reconcile_open_positions(
             continue
 
         row = analyze_market(df)
-        price = row["close"]
+        price = select_evaluation_price(df, row, in_position=True)
         atr = row["atr"]
         usd_value = held_amount * price
-        if usd_value < max(min_value_usd, 1.0):
-            continue
-
         profile_name = symbol_profiles[symbol]
         profile = profile_settings[profile_name]
-        pos = positions[symbol]
-        pos["in_position"] = True
-        pos["position_amount"] = held_amount
-        pos["entry_price"] = price
-        pos["peak_price"] = price
-        pos["trailing_stop_price"] = price - (atr * profile["atr_multiplier"])
-        pos["trailing_profit_target"] = price * (1 + profile["profit_target_pct"])
-        pos["breakeven_set"] = False
-        print(
-            f"[{base_currency}] ♻️  Reconciled existing position: {held_amount:.6f} "
-            f"@ ~{format_price(price)} (${usd_value:.2f})"
+        planned = plan_reconciled_position(
+            held_amount,
+            usd_value,
+            min_value_usd,
+            price,
+            atr,
+            profile["atr_multiplier"],
+            profile["profit_target_pct"],
+            journal_positions.get(symbol),
         )
+        if planned is None:
+            continue
+
+        if planned["manage_exits"]:
+            positions[symbol].update(planned)
+            print(
+                f"[{base_currency}] ♻️  Restored journaled position: "
+                f"{planned['position_amount']:.6f} @ {format_price(planned['entry_price'])} "
+                f"(held {held_amount:.6f}, ${usd_value:.2f})"
+            )
+        else:
+            # Holdings the bot did not buy are left out of its positions entirely: no
+            # stops, no targets, and they do not count toward max_open. The bot may still
+            # buy this coin; it then manages (and sells) only its own fill.
+            print(
+                f"[{base_currency}] ♻️  Existing {held_amount:.6f} {base_currency} "
+                f"(${usd_value:.2f}) has no journaled bot entry. Leaving it alone "
+                "(no stops or targets)."
+            )
         journal.log_event(
             "position_reconciled",
             symbol=symbol,
             profile=profile_name,
-            status="reconciled",
-            price=price,
-            amount=held_amount,
+            status="restored" if planned["manage_exits"] else "hold_only",
+            price=planned["entry_price"] or price,
+            amount=planned["position_amount"],
             cost_usd=usd_value,
-            payload={"note": "entry_price is a best-effort estimate from current price"},
+            payload={
+                "manage_exits": planned["manage_exits"],
+                "held_amount": held_amount,
+                "note": (
+                    "restored from journaled fill"
+                    if planned["manage_exits"]
+                    else "unknown-origin holding; not managed by the bot"
+                ),
+            },
         )
 
 
@@ -618,11 +738,13 @@ except Exception as exc:
     print(f"❌ Connection Error: {exc}")
     sys.exit()
 
+leverage_setup_succeeded = True
 try:
     for symbol in symbols:
         exchange.set_leverage(leverage, symbol)
     print(f"⚡ Leverage set to {leverage}x for all symbols.")
 except Exception as exc:
+    leverage_setup_succeeded = False
     journal.log_event(
         "warning",
         reason="set_leverage_not_supported",
@@ -631,11 +753,15 @@ except Exception as exc:
     )
     print(f"⚠️  Could not set leverage automatically: {exc}")
 
+effective_leverage = resolve_effective_leverage(leverage, leverage_setup_succeeded)
+
 if leverage > 1:
     print(
         f"⚠️  TRADING_LEVERAGE={leverage}. Coinbase Advanced Trade spot has no leverage; "
         "set TRADING_LEVERAGE=1 unless you are certain your account supports margin."
     )
+    if effective_leverage == 1:
+        print("🛡️ Leverage setup failed; sizing new entries with 1x spot buying power.")
 
 positions = {}
 for symbol in symbols:
@@ -648,6 +774,8 @@ for symbol in symbols:
         "peak_price": 0.0,
         "trailing_profit_target": 0.0,
         "last_exit_time": 0,
+        "orders_halted": False,
+        "manage_exits": True,
     }
 
 if reconcile_on_start:
@@ -707,28 +835,26 @@ journal.log_event(
         "regime_symbols": benchmark_symbols,
         "risk_pct": risk_pct,
         "leverage": leverage,
+        "effective_leverage": effective_leverage,
         "enable_trading": enable_trading,
         "journal_backend": journal.describe_backend(),
     },
 )
 
-daily_state = new_daily_state(current_day_key())
-
-try:
-    initial_snapshot = fetch_portfolio_snapshot(exchange)
-    daily_state["start_equity_usd"] = initial_snapshot["total_estimated_usd"]
-    journal.log_portfolio_snapshot(
-        total_estimated_usd=initial_snapshot["total_estimated_usd"],
-        free_usd=initial_snapshot["free_usd"],
-        invested_usd=initial_snapshot["invested_usd"],
-        positions=initial_snapshot["positions"],
-    )
-except Exception as exc:
+daily_state = initialize_daily_state(exchange, journal, current_day_key())
+if daily_loss_limit_pct > 0 and daily_state.get("start_equity_usd", 0) <= 0:
     journal.log_event(
         "warning",
-        reason="initial_snapshot_failed",
+        reason="daily_loss_equity_unavailable",
         status="warning",
-        payload={"message": str(exc)},
+        payload={
+            "message": "Daily loss limit is enabled but no start-of-day equity baseline is available; new entries will be blocked.",
+            "loss_limit_pct": daily_loss_limit_pct,
+        },
+    )
+    print(
+        "🛑 Daily loss guardrail has no start-of-day equity baseline; "
+        "blocking new entries until a portfolio snapshot is available."
     )
 
 last_regime_label = None
@@ -763,7 +889,8 @@ while True:
                 continue
 
             row = analyze_market(df)
-            price = row["close"]
+            pos = positions[symbol]
+            price = select_evaluation_price(df, row, pos["in_position"])
             ema_20 = row["ema_20"]
             atr = row["atr"]
             rsi = row["rsi"]
@@ -771,7 +898,6 @@ while True:
             volume_ratio = row.get("volume_ratio", 1.0)
 
             base_currency = symbol.split("/")[0]
-            pos = positions[symbol]
             profile_name = symbol_profiles[symbol]
             profile = profile_settings[profile_name]
 
@@ -788,12 +914,17 @@ while True:
                 dynamic_spike_reversal *= profile["high_volatility_spike_scale"]
                 dynamic_atr_multiplier *= profile["high_volatility_atr_scale"]
 
+            position_label = (
+                "HALTED" if pos.get("orders_halted") else ("YES" if pos["in_position"] else "NO")
+            )
             print(
                 f"[{base_currency}] Price: {format_price(price)} | RSI: {rsi:.2f} | "
                 f"Stop: {format_price(pos['trailing_stop_price'])} | "
-                f"Position: {'YES' if pos['in_position'] else 'NO'} | "
+                f"Position: {position_label} | "
                 f"Profile: {profile_name}"
             )
+            if pos.get("orders_halted"):
+                continue
 
             if not pos["in_position"]:
                 current_time = time.time()
@@ -895,7 +1026,9 @@ while True:
 
                 if price_above_ema and rsi_strong and trend_strong_enough and ema_trending_up and volume_adequate:
                     risk_slice = risk_pct * symbol_weights[symbol] / total_risk_weight
-                    amount, cost = get_position_size(exchange, symbol, price, risk_slice, leverage)
+                    amount, cost = get_position_size(
+                        exchange, symbol, price, risk_slice, effective_leverage
+                    )
 
                     if cost < min_order_size:
                         journal.log_event(
@@ -927,7 +1060,7 @@ while True:
                         )
                         continue
 
-                    entry_executed, filled_amount, fill_price = place_entry_order(
+                    entry_executed, filled_amount, fill_price, entry_ambiguous = place_entry_order(
                         exchange,
                         symbol,
                         base_currency,
@@ -937,6 +1070,12 @@ while True:
                         limit_order_offset_pct,
                         enable_trading,
                     )
+
+                    if entry_ambiguous:
+                        halt_symbol_orders(
+                            pos, journal, symbol, profile_name, regime_label, "buy", "entry"
+                        )
+                        continue
 
                     if entry_executed:
                         effective_price = fill_price if fill_price and fill_price > 0 else price
@@ -948,6 +1087,7 @@ while True:
                         pos["trailing_profit_target"] = effective_price * (1 + dynamic_profit_target)
                         pos["in_position"] = True
                         pos["breakeven_set"] = False
+                        pos["manage_exits"] = True
                         record_trade(daily_state, symbol, signal=current_signal)
                         journal.log_event(
                             "entry_executed",
@@ -955,7 +1095,7 @@ while True:
                             profile=profile_name,
                             regime=regime_label,
                             side="buy",
-                            status="executed",
+                            status="executed" if enable_trading else "simulated",
                             price=effective_price,
                             amount=effective_amount,
                             cost_usd=cost,
@@ -982,6 +1122,9 @@ while True:
                         )
 
             else:
+                if not pos.get("manage_exits", True):
+                    continue
+
                 entry_price = pos["entry_price"]
                 profit_pct = (price - entry_price) / entry_price if entry_price > 0 else 0
 
@@ -1095,6 +1238,11 @@ while True:
                     # A breached stop always exits at market, whatever the trigger.
                     force_market=stop_hit,
                 )
+                if exit_result == EXIT_AMBIGUOUS:
+                    halt_symbol_orders(
+                        pos, journal, symbol, profile_name, regime_label, "sell", exit_reason
+                    )
+                    continue
                 if exit_result == EXIT_NOTHING_TO_SELL:
                     # The coins were sold or moved outside the bot (or only dust is left).
                     # Close the tracked position, but no sale happened here, so record no P&L.
@@ -1122,7 +1270,7 @@ while True:
                         regime=regime_label,
                         side="sell",
                         reason=exit_reason,
-                        status="executed",
+                        status="executed" if enable_trading else "simulated",
                         price=price,
                         amount=pos["position_amount"],
                         cost_usd=price * pos["position_amount"],

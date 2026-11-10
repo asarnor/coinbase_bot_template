@@ -9,12 +9,18 @@ from datetime import datetime, timezone
 from risk_limits import (
     compute_position_size,
     current_day_key,
+    daily_utc_bounds,
     evaluate_entry_limits,
     extract_fill,
+    order_failure_is_ambiguous,
     new_daily_state,
+    plan_reconciled_position,
     record_realized_pnl,
     record_trade,
     reset_daily_state,
+    resolve_effective_leverage,
+    restore_daily_state_from_events,
+    restore_open_positions_from_events,
     setup_is_stronger,
     symbol_loss_limit_hit,
     symbol_realized_pnl,
@@ -57,6 +63,17 @@ class ComputePositionSizeTests(unittest.TestCase):
         self.assertAlmostEqual(amount, 1.0)
 
 
+class ResolveEffectiveLeverageTests(unittest.TestCase):
+    def test_uses_requested_leverage_after_successful_setup(self):
+        self.assertEqual(resolve_effective_leverage(5, setup_succeeded=True), 5)
+
+    def test_falls_back_to_spot_sizing_when_setup_fails(self):
+        self.assertEqual(resolve_effective_leverage(5, setup_succeeded=False), 1.0)
+
+    def test_never_returns_less_than_one_after_successful_setup(self):
+        self.assertEqual(resolve_effective_leverage(0, setup_succeeded=True), 1.0)
+
+
 class ExtractFillTests(unittest.TestCase):
     def test_reads_filled_and_average(self):
         order = {"filled": 1.2345, "average": 101.5}
@@ -90,6 +107,11 @@ class DailyStateTests(unittest.TestCase):
     def test_current_day_key_uses_utc(self):
         moment = datetime(2026, 7, 3, 23, 59, tzinfo=timezone.utc)
         self.assertEqual(current_day_key(moment), "2026-07-03")
+
+    def test_daily_utc_bounds_cover_one_utc_day(self):
+        start, end = daily_utc_bounds("2026-07-03")
+        self.assertEqual(start, "2026-07-03T00:00:00+00:00")
+        self.assertEqual(end, "2026-07-04T00:00:00+00:00")
 
     def test_record_trade_tracks_per_coin(self):
         state = new_daily_state("2026-07-03", start_equity_usd=1000)
@@ -190,6 +212,16 @@ class EvaluateEntryLimitsTests(unittest.TestCase):
             evaluate_entry_limits(state, "ETH/USD", 0, 3, 0, 6, 0.05), []
         )
 
+    def test_blocks_when_loss_limit_enabled_without_equity_baseline(self):
+        state = new_daily_state("2026-07-03", start_equity_usd=0)
+        reasons = evaluate_entry_limits(state, "BTC/USD", 0, 3, 0, 6, 0.05)
+        self.assertIn("daily_loss_equity_unavailable", reasons)
+
+    def test_missing_equity_baseline_does_not_block_when_loss_limit_disabled(self):
+        state = new_daily_state("2026-07-03", start_equity_usd=0)
+        reasons = evaluate_entry_limits(state, "BTC/USD", 0, 3, 0, 6, 0)
+        self.assertNotIn("daily_loss_equity_unavailable", reasons)
+
     def test_respects_latched_symbol_halt(self):
         state = self._state()
         state["symbol_halted"]["BTC/USD"] = True
@@ -203,6 +235,75 @@ class EvaluateEntryLimitsTests(unittest.TestCase):
         # Global cap of 4 reached -> blocked regardless of per-coin room.
         reasons = evaluate_entry_limits(state, "FET/USD", 0, 3, 4, 6, 0.05)
         self.assertIn("max_trades_per_day", reasons)
+
+
+class RestoreDailyStateFromEventsTests(unittest.TestCase):
+    def test_restores_trade_counts_pnl_halts_and_last_signal(self):
+        events = [
+            {
+                "event_type": "entry_executed",
+                "symbol": "BTC/USD",
+                "status": "executed",
+                "payload_json": '{"rsi": 61.5, "trend_strength": 0.02, "volume_ratio": 1.4}',
+            },
+            {
+                "event_type": "entry_executed",
+                "symbol": "ETH/USD",
+                "status": "executed",
+                "payload": {"rsi": 58.0, "trend_strength": 0.015, "volume_ratio": 1.1},
+            },
+            {
+                "event_type": "exit_executed",
+                "symbol": "BTC/USD",
+                "status": "executed",
+                "payload_json": '{"estimated_pnl_usd": -75.25}',
+            },
+            {
+                "event_type": "daily_loss_limit_triggered",
+                "symbol": "BTC/USD",
+                "status": "halted",
+                "payload_json": "{}",
+            },
+        ]
+
+        state = restore_daily_state_from_events(
+            "2026-07-03", events, start_equity_usd=1000
+        )
+
+        self.assertEqual(state["day"], "2026-07-03")
+        self.assertAlmostEqual(state["start_equity_usd"], 1000)
+        self.assertEqual(state["trades"], 2)
+        self.assertEqual(symbol_trade_count(state, "BTC/USD"), 1)
+        self.assertEqual(symbol_trade_count(state, "ETH/USD"), 1)
+        self.assertAlmostEqual(symbol_realized_pnl(state, "BTC/USD"), -75.25)
+        self.assertTrue(state["symbol_halted"]["BTC/USD"])
+        self.assertAlmostEqual(
+            state["symbol_last_entry_signal"]["BTC/USD"]["volume_ratio"], 1.4
+        )
+
+    def test_ignores_unexecuted_and_malformed_events(self):
+        events = [
+            {
+                "event_type": "entry_executed",
+                "symbol": "BTC/USD",
+                "status": "pending_or_failed",
+                "payload_json": '{"rsi": 90}',
+            },
+            {
+                "event_type": "exit_executed",
+                "symbol": "BTC/USD",
+                "status": "executed",
+                "payload_json": "{not-json",
+            },
+        ]
+
+        state = restore_daily_state_from_events(
+            "2026-07-03", events, start_equity_usd=1000
+        )
+
+        self.assertEqual(state["trades"], 0)
+        self.assertEqual(state["symbol_trades"], {})
+        self.assertEqual(state["symbol_realized_pnl_usd"], {})
 
 
 class StrongerSetupTests(unittest.TestCase):
@@ -283,6 +384,323 @@ class StrongerSetupTests(unittest.TestCase):
         state = self._state_with_entry(STRONG)
         reasons = evaluate_entry_limits(state, "BTC/USD", 1, 3, 0, 6, 0.05)
         self.assertNotIn("setup_not_stronger", reasons)
+
+
+class OrderFailureAmbiguityTests(unittest.TestCase):
+    def test_timeout_is_ambiguous(self):
+        class NetworkError(Exception):
+            pass
+
+        class RequestTimeout(NetworkError):
+            pass
+
+        self.assertTrue(order_failure_is_ambiguous(RequestTimeout("timed out")))
+
+    def test_exchange_unavailable_is_ambiguous(self):
+        class NetworkError(Exception):
+            pass
+
+        class ExchangeNotAvailable(NetworkError):
+            pass
+
+        self.assertTrue(order_failure_is_ambiguous(ExchangeNotAvailable("503")))
+
+    def test_bad_response_is_ambiguous(self):
+        class OperationFailed(Exception):
+            pass
+
+        class BadResponse(OperationFailed):
+            pass
+
+        self.assertTrue(order_failure_is_ambiguous(BadResponse("malformed")))
+
+    def test_connection_error_is_ambiguous(self):
+        self.assertTrue(order_failure_is_ambiguous(ConnectionError("reset")))
+
+    def test_insufficient_funds_is_a_definite_rejection(self):
+        class ExchangeError(Exception):
+            pass
+
+        class InsufficientFunds(ExchangeError):
+            pass
+
+        self.assertFalse(order_failure_is_ambiguous(InsufficientFunds("not enough")))
+
+    def test_invalid_order_is_a_definite_rejection(self):
+        class ExchangeError(Exception):
+            pass
+
+        class InvalidOrder(ExchangeError):
+            pass
+
+        self.assertFalse(order_failure_is_ambiguous(InvalidOrder("below minimum")))
+
+    def test_rate_limit_is_a_definite_rejection(self):
+        class NetworkError(Exception):
+            pass
+
+        class RateLimitExceeded(NetworkError):
+            pass
+
+        self.assertFalse(order_failure_is_ambiguous(RateLimitExceeded("429")))
+
+    def test_nonce_error_is_a_definite_rejection(self):
+        class NetworkError(Exception):
+            pass
+
+        class InvalidNonce(NetworkError):
+            pass
+
+        self.assertFalse(order_failure_is_ambiguous(InvalidNonce("timestamp expired")))
+
+    def test_internal_server_error_text_is_ambiguous_even_on_exchange_error(self):
+        class ExchangeError(Exception):
+            pass
+
+        self.assertTrue(
+            order_failure_is_ambiguous(ExchangeError("coinbase internal_server_error"))
+        )
+
+    def test_none_is_not_ambiguous(self):
+        self.assertFalse(order_failure_is_ambiguous(None))
+
+
+class RestoreOpenPositionsTests(unittest.TestCase):
+    def test_entry_without_exit_stays_open(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.05},
+            {"event_type": "entry_executed", "symbol": "BTC/USD", "price": 60000, "amount": 0.01},
+        ]
+        restored = restore_open_positions_from_events(events)
+        self.assertEqual(restored["ETH/USD"]["amount"], 0.05)
+        self.assertEqual(restored["BTC/USD"]["entry_price"], 60000)
+
+    def test_exit_clears_open_entry(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.05},
+            {"event_type": "exit_executed", "symbol": "ETH/USD", "price": 3100, "amount": 0.05},
+        ]
+        self.assertEqual(restore_open_positions_from_events(events), {})
+
+    def test_later_entry_replaces_earlier_one(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 2800, "amount": 0.1},
+            {"event_type": "exit_executed", "symbol": "ETH/USD"},
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.04},
+        ]
+        restored = restore_open_positions_from_events(events)
+        self.assertAlmostEqual(restored["ETH/USD"]["entry_price"], 3000)
+        self.assertAlmostEqual(restored["ETH/USD"]["amount"], 0.04)
+
+    def test_balance_reconcile_events_are_not_treated_as_entries(self):
+        events = [
+            {
+                "event_type": "position_reconciled",
+                "symbol": "ETH/USD",
+                "price": 3000,
+                "amount": 2.0,
+            }
+        ]
+        self.assertEqual(restore_open_positions_from_events(events), {})
+
+    def test_close_without_sale_and_sync_clear_close_the_entry(self):
+        for closing in (
+            {"event_type": "position_closed_without_sale", "symbol": "ETH/USD"},
+            {"event_type": "position_synced", "symbol": "ETH/USD", "status": "clear", "amount": 0.0},
+        ):
+            events = [
+                {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.05},
+                closing,
+            ]
+            self.assertEqual(restore_open_positions_from_events(events), {}, closing)
+
+    def test_sync_resize_updates_the_amount(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "price": 3000, "amount": 0.05},
+            {"event_type": "position_synced", "symbol": "ETH/USD", "status": "resize", "amount": 0.03},
+        ]
+        restored = restore_open_positions_from_events(events)
+        self.assertAlmostEqual(restored["ETH/USD"]["amount"], 0.03)
+        self.assertAlmostEqual(restored["ETH/USD"]["entry_price"], 3000)
+
+    def test_simulated_entries_are_not_restored(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "status": "simulated",
+             "price": 3000, "amount": 0.05},
+        ]
+        self.assertEqual(restore_open_positions_from_events(events), {})
+
+    def test_simulated_exit_does_not_close_a_live_entry(self):
+        events = [
+            {"event_type": "entry_executed", "symbol": "ETH/USD", "status": "executed",
+             "price": 3000, "amount": 0.05},
+            {"event_type": "exit_executed", "symbol": "ETH/USD", "status": "simulated"},
+        ]
+        self.assertIn("ETH/USD", restore_open_positions_from_events(events))
+
+    def test_sync_resize_without_an_entry_does_not_create_one(self):
+        events = [{"event_type": "position_synced", "symbol": "ETH/USD", "status": "resize", "amount": 1.0}]
+        self.assertEqual(restore_open_positions_from_events(events), {})
+
+
+class PlanReconciledPositionTests(unittest.TestCase):
+    def test_unknown_holdings_do_not_arm_a_stop(self):
+        # Concrete dump trigger: 2 ETH savings, no journaled bot fill, 5m ATR stop
+        # at mark would fire on a <1% dip and sell the whole bag.
+        planned = plan_reconciled_position(
+            held_amount=2.0,
+            usd_value=7000.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=10.0,
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+        )
+        self.assertIsNotNone(planned)
+        self.assertTrue(planned["in_position"])
+        self.assertFalse(planned["manage_exits"])
+        self.assertEqual(planned["trailing_stop_price"], 0.0)
+        self.assertEqual(planned["entry_price"], 0.0)
+        self.assertEqual(planned["position_amount"], 2.0)
+        # A live price just under the old mark-ATR stop must not be a stop-out.
+        old_synthetic_stop = 3500.0 - (10.0 * 1.6)
+        self.assertGreater(3490.0, old_synthetic_stop)
+        self.assertGreater(3490.0, planned["trailing_stop_price"])
+
+    def test_journaled_fill_caps_size_to_bot_amount(self):
+        planned = plan_reconciled_position(
+            held_amount=2.0,
+            usd_value=7000.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=10.0,
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+            journal_position={"entry_price": 3000.0, "amount": 0.05},
+        )
+        self.assertTrue(planned["manage_exits"])
+        self.assertAlmostEqual(planned["position_amount"], 0.05)
+        self.assertAlmostEqual(planned["entry_price"], 3000.0)
+        self.assertAlmostEqual(planned["trailing_stop_price"], 3500.0 - 16.0)
+        self.assertAlmostEqual(planned["trailing_profit_target"], 3000.0 * 1.03)
+
+    def test_journaled_amount_cannot_exceed_holdings(self):
+        planned = plan_reconciled_position(
+            held_amount=0.04,
+            usd_value=140.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=10.0,
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+            journal_position={"entry_price": 3000.0, "amount": 0.05},
+        )
+        self.assertAlmostEqual(planned["position_amount"], 0.04)
+        self.assertTrue(planned["manage_exits"])
+
+    def test_dust_below_minimum_is_ignored(self):
+        self.assertIsNone(
+            plan_reconciled_position(
+                held_amount=0.0001,
+                usd_value=0.35,
+                min_value_usd=5.0,
+                current_price=3500.0,
+                atr=10.0,
+                atr_multiplier=1.6,
+                profit_target_pct=0.03,
+            )
+        )
+
+    def test_invalid_atr_does_not_create_nan_stop(self):
+        planned = plan_reconciled_position(
+            held_amount=0.05,
+            usd_value=175.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=float("nan"),
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+            journal_position={"entry_price": 3000.0, "amount": 0.05},
+        )
+        self.assertTrue(planned["manage_exits"])
+        self.assertEqual(planned["trailing_stop_price"], 0.0)
+
+    def test_profit_target_with_zero_entry_is_not_immediately_true(self):
+        # Guard the historic trap: entry_price=0 made profit_target_price=0, so
+        # any market price looked like a target hit and sold the wallet.
+        planned = plan_reconciled_position(
+            held_amount=2.0,
+            usd_value=7000.0,
+            min_value_usd=5.0,
+            current_price=3500.0,
+            atr=10.0,
+            atr_multiplier=1.6,
+            profit_target_pct=0.03,
+        )
+        self.assertEqual(planned["trailing_profit_target"], 0.0)
+        self.assertFalse(planned["manage_exits"])
+
+
+class JournalLifecycleQueryTests(unittest.TestCase):
+    def test_start_snapshot_lookup_stays_within_the_day(self):
+        import os
+        import tempfile
+
+        from trading_journal import TradingJournal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = TradingJournal(database_url=None, sqlite_path=os.path.join(tmp, "j.db"), enabled=True)
+            journal.log_portfolio_snapshot(total_estimated_usd=1234.0, free_usd=0.0, invested_usd=0.0, positions=[])
+            # A window entirely in the past must not pick up today's snapshot.
+            past = journal.get_first_snapshot_after("2000-01-01T00:00:00+00:00", "2000-01-02T00:00:00+00:00")
+            unbounded = journal.get_first_snapshot_after("2000-01-01T00:00:00+00:00")
+            journal.close()
+
+        self.assertIsNone(past)
+        self.assertIsNotNone(unbounded)
+
+    def test_lifecycle_query_skips_non_fill_events(self):
+        import os
+        import tempfile
+
+        from trading_journal import TradingJournal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "journal.db")
+            journal = TradingJournal(database_url=None, sqlite_path=path, enabled=True)
+            journal.log_event("entry_executed", symbol="ETH/USD", price=3000, amount=0.05)
+            journal.log_event("signal_evaluation", symbol="ETH/USD")
+            journal.log_event("exit_executed", symbol="ETH/USD", price=3100, amount=0.05)
+            rows = journal.get_trade_lifecycle_events()
+            journal.close()
+
+        self.assertEqual([row["event_type"] for row in rows], ["entry_executed", "exit_executed"])
+        restored = restore_open_positions_from_events(rows)
+        self.assertEqual(restored, {})
+
+    def test_lifecycle_query_limit_keeps_the_newest_events_in_order(self):
+        import os
+        import tempfile
+        import time as _time
+
+        from trading_journal import TradingJournal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "journal.db")
+            journal = TradingJournal(database_url=None, sqlite_path=path, enabled=True)
+            journal.log_event("entry_executed", symbol="ETH/USD", price=2800, amount=0.1)
+            _time.sleep(0.01)
+            journal.log_event("position_closed_without_sale", symbol="ETH/USD", amount=0.1)
+            _time.sleep(0.01)
+            journal.log_event("entry_executed", symbol="ETH/USD", price=3000, amount=0.04)
+            rows = journal.get_trade_lifecycle_events(limit=2)
+            journal.close()
+
+        self.assertEqual(
+            [row["event_type"] for row in rows],
+            ["position_closed_without_sale", "entry_executed"],
+        )
+        self.assertAlmostEqual(restore_open_positions_from_events(rows)["ETH/USD"]["entry_price"], 3000)
 
 
 def price_for(cost, amount):

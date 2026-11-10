@@ -6,6 +6,7 @@ Run with:  python -m unittest test_position_sync    (no network, no extra depend
 import unittest
 
 from position_sync import (
+    EXIT_AMBIGUOUS,
     EXIT_FAILED,
     EXIT_NOTHING_TO_SELL,
     EXIT_SOLD,
@@ -18,8 +19,16 @@ from position_sync import (
 )
 
 
-class InsufficientFunds(Exception):
+class ExchangeError(Exception):
+    """Stand-in for ccxt.ExchangeError: Coinbase definitely rejected the request."""
+
+
+class InsufficientFunds(ExchangeError):
     pass
+
+
+class RequestTimeout(Exception):
+    """Stand-in for ccxt.RequestTimeout (a NetworkError): the result is unknown."""
 
 
 class FakeExchange:
@@ -236,6 +245,58 @@ class HoldsAndBalanceSourceTests(unittest.TestCase):
         self.assertEqual(ex.market_sells, [])
 
 
+class AmbiguousExitTests(unittest.TestCase):
+    def test_market_sell_timeout_is_ambiguous(self):
+        ex = FakeExchange(total=1.0)
+
+        def timeout(symbol, amount):
+            raise RequestTimeout("read timed out")
+
+        ex.create_market_sell_order = timeout
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_AMBIGUOUS)
+
+    def test_limit_create_timeout_does_not_fall_back_to_market(self):
+        ex = FakeExchange(total=1.0)
+
+        def timeout(symbol, amount, price):
+            raise RequestTimeout("read timed out")
+
+        ex.create_limit_sell_order = timeout
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Profit-taking", True, 0.001, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_AMBIGUOUS)
+        self.assertEqual(ex.market_sells, [])
+
+    def test_limit_exit_without_an_order_id_is_ambiguous(self):
+        ex = FakeExchange(total=1.0)
+        ex.create_limit_sell_order = lambda symbol, amount, price: {}
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Profit-taking", True, 0.001, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_AMBIGUOUS)
+        self.assertEqual(ex.market_sells, [])
+
+    def test_ticker_failure_before_any_order_is_not_ambiguous(self):
+        ex = FakeExchange(total=1.0)
+
+        def no_ticker(symbol):
+            raise RequestTimeout("ticker timed out")
+
+        ex.fetch_ticker = no_ticker
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Profit-taking", True, 0.001, True, sleep=no_sleep)
+        # No limit order was sent, so the market fallback is safe.
+        self.assertEqual(result, EXIT_SOLD)
+        self.assertEqual(ex.market_sells, [1.0])
+
+    def test_definite_rejection_is_a_plain_failure(self):
+        ex = FakeExchange(total=1.0)
+
+        def rejected(symbol, amount):
+            raise InsufficientFunds("INSUFFICIENT_FUND")
+
+        ex.create_market_sell_order = rejected
+        result = place_exit_order(ex, "ETH/USD", "ETH", 1.0, "Stop-loss", False, 0.0, True, sleep=no_sleep)
+        self.assertEqual(result, EXIT_FAILED)
+
+
 class CancelOpenOrdersTests(unittest.TestCase):
     def test_cancels_only_requested_side(self):
         ex = FakeExchange(total=1.0)
@@ -281,6 +342,10 @@ class ReconcileActionTests(unittest.TestCase):
 
     def test_large_difference_is_resized(self):
         self.assertEqual(reconcile_action(True, 1.0, 0.5, 2000.0, 5.0), "resize")
+
+    def test_extra_coins_in_account_never_grow_the_position(self):
+        # 0.05 ETH bought by the bot on top of a 1.0 ETH long-term holding.
+        self.assertEqual(reconcile_action(True, 0.05, 1.05, 2000.0, 5.0), "none")
 
     def test_untracked_holding_is_left_alone_by_default(self):
         self.assertEqual(reconcile_action(False, 0.0, 66.65, 10.25, 5.0), "none")

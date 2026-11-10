@@ -9,14 +9,23 @@ Daily limits are tracked PER COIN: each symbol gets its own trade counter, reali
 P&L tally, and loss-limit halt. A losing or maxed-out coin is paused for the rest of
 the UTC day while the other coins keep trading normally.
 """
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+import json
+from datetime import datetime, timedelta, timezone
+from math import isfinite
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 def current_day_key(now: Optional[datetime] = None) -> str:
     """Return the current UTC day as an YYYY-MM-DD string (used to reset counters)."""
     moment = now or datetime.now(timezone.utc)
     return moment.strftime("%Y-%m-%d")
+
+
+def daily_utc_bounds(day: str) -> Tuple[str, str]:
+    """Return inclusive/exclusive UTC ISO bounds for a YYYY-MM-DD day key."""
+    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
 
 
 def new_daily_state(day: str, start_equity_usd: float = 0.0) -> Dict:
@@ -70,6 +79,59 @@ def symbol_realized_pnl(state: Dict, symbol: str) -> float:
     return state["symbol_realized_pnl_usd"].get(symbol, 0.0)
 
 
+def _event_payload(event: Dict) -> Dict:
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        return payload
+
+    raw_payload = event.get("payload_json")
+    if isinstance(raw_payload, dict):
+        return raw_payload
+    if isinstance(raw_payload, str) and raw_payload:
+        try:
+            parsed = json.loads(raw_payload)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _as_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def restore_daily_state_from_events(
+    day: str, events: Iterable[Dict], start_equity_usd: float = 0.0
+) -> Dict:
+    """Rebuild daily risk counters from persisted journal events for one UTC day."""
+    state = new_daily_state(day, start_equity_usd)
+
+    for event in events:
+        symbol = event.get("symbol")
+        event_type = event.get("event_type")
+        status = event.get("status")
+        payload = _event_payload(event)
+
+        if event_type == "entry_executed" and symbol and status == "executed":
+            signal = {
+                key: payload[key]
+                for key in ("rsi", "trend_strength", "volume_ratio")
+                if key in payload
+            }
+            record_trade(state, symbol, signal=signal or None)
+        elif event_type == "exit_executed" and symbol and status == "executed":
+            pnl = _as_float(payload.get("estimated_pnl_usd"))
+            if pnl is not None:
+                record_realized_pnl(state, symbol, pnl)
+        elif event_type == "daily_loss_limit_triggered" and symbol:
+            state["symbol_halted"][symbol] = True
+
+    return state
+
+
 def symbol_loss_limit_hit(state: Dict, symbol: str, limit_pct: float) -> bool:
     """True when a single coin's realized loss for the day breaches its own budget.
 
@@ -98,6 +160,51 @@ def compute_position_size(
         cost = spendable_cap
     amount = cost / price
     return amount, cost
+
+
+def resolve_effective_leverage(requested_leverage: float, setup_succeeded: bool) -> float:
+    """Use requested leverage only after the exchange confirms leverage is active."""
+    if not setup_succeeded:
+        return 1.0
+    return max(requested_leverage, 1.0)
+
+
+# Exchange responses that mean "this attempt was rejected" and can be retried.
+# Timeouts, connection loss, and unreadable bodies are intentionally absent:
+# the order may already have been accepted.
+_DEFINITE_REJECTION_TYPES = frozenset(
+    {
+        "ExchangeError",
+        "RateLimitExceeded",
+        "DDoSProtection",
+        "InvalidNonce",
+    }
+)
+_AMBIGUOUS_SERVER_MARKERS = (
+    "internal_server_error",
+    "internal server error",
+)
+
+
+def order_failure_is_ambiguous(exc: BaseException) -> bool:
+    """True when a create-order exception may mean the order was still accepted.
+
+    Coinbase (via ccxt) raises ExchangeError subclasses (InsufficientFunds,
+    InvalidOrder, ...) for a rejected request, so that attempt did not trade and a
+    later retry is safe. Request timeouts, dropped connections, HTTP 5xx
+    (ExchangeNotAvailable) and unreadable bodies do not prove the order is absent;
+    retrying those can buy or sell again.
+    """
+    if exc is None:
+        return False
+
+    type_names = {cls.__name__ for cls in type(exc).__mro__}
+    message = str(exc).lower()
+    if any(marker in message for marker in _AMBIGUOUS_SERVER_MARKERS):
+        return True
+    if type_names & _DEFINITE_REJECTION_TYPES:
+        return False
+    return True
 
 
 def extract_fill(
@@ -187,7 +294,9 @@ def evaluate_entry_limits(
     """
     reasons: List[str] = []
 
-    if state["symbol_halted"].get(symbol) or symbol_loss_limit_hit(
+    if daily_loss_limit_pct > 0 and state.get("start_equity_usd", 0) <= 0:
+        reasons.append("daily_loss_equity_unavailable")
+    elif state["symbol_halted"].get(symbol) or symbol_loss_limit_hit(
         state, symbol, daily_loss_limit_pct
     ):
         reasons.append("daily_loss_limit")
@@ -212,3 +321,116 @@ def evaluate_entry_limits(
             reasons.append("setup_not_stronger")
 
     return reasons
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if not isfinite(number):
+        return default
+    return number
+
+
+def restore_open_positions_from_events(events: List[Dict]) -> Dict[str, Dict]:
+    """Replay journaled fills and return still-open bot positions keyed by symbol.
+
+    `entry_executed` opens a position (only live fills, `status == "executed"`;
+    simulated dry-run fills are ignored). `exit_executed`, `position_closed_without_sale`
+    and a `position_synced` "clear" close it; a `position_synced` "resize" updates its
+    amount. Startup balance reconciliations are ignored so a previous mark-price
+    estimate cannot be treated as a real entry on the next restart.
+    """
+    open_positions: Dict[str, Dict] = {}
+    for event in events:
+        event_type = event.get("event_type")
+        symbol = event.get("symbol")
+        if not symbol:
+            continue
+        if event_type in ("entry_executed", "exit_executed") and (event.get("status") or "executed") != "executed":
+            # Simulated (dry-run) fills never touched the exchange.
+            continue
+        if event_type == "entry_executed":
+            open_positions[symbol] = {
+                "entry_price": _safe_float(event.get("price")),
+                "amount": _safe_float(event.get("amount")),
+            }
+        elif event_type in ("exit_executed", "position_closed_without_sale"):
+            open_positions.pop(symbol, None)
+        elif event_type == "position_synced":
+            status = event.get("status")
+            if status == "clear":
+                open_positions.pop(symbol, None)
+            elif status == "resize" and symbol in open_positions:
+                amount = _safe_float(event.get("amount"))
+                if amount > 0:
+                    open_positions[symbol]["amount"] = amount
+                else:
+                    open_positions.pop(symbol, None)
+    return open_positions
+
+
+def plan_reconciled_position(
+    held_amount: float,
+    usd_value: float,
+    min_value_usd: float,
+    current_price: float,
+    atr: float,
+    atr_multiplier: float,
+    profit_target_pct: float,
+    journal_position: Optional[Dict] = None,
+) -> Optional[Dict]:
+    """Decide how to adopt an exchange balance after a bot restart.
+
+    Unknown-origin holdings (no journaled fill) come back with `manage_exits`
+    False; the caller leaves them out of the bot's positions. Arming an ATR stop
+    at mark price against the full wallet would sell long-term BTC/ETH/etc. on
+    the next small dip.
+
+    Journaled bot entries restore the recorded size (capped by what is actually
+    held) and keep stop/profit management enabled.
+    """
+    held_amount = _safe_float(held_amount)
+    usd_value = _safe_float(usd_value)
+    current_price = _safe_float(current_price)
+    if held_amount <= 0 or current_price <= 0:
+        return None
+    if usd_value < max(_safe_float(min_value_usd), 1.0):
+        return None
+
+    journal_entry = 0.0
+    journal_amount = 0.0
+    if journal_position:
+        journal_entry = _safe_float(journal_position.get("entry_price"))
+        journal_amount = _safe_float(journal_position.get("amount"))
+
+    if journal_entry > 0 and journal_amount > 0:
+        amount = min(held_amount, journal_amount)
+        atr_value = _safe_float(atr)
+        if atr_value > 0:
+            trailing_stop = current_price - (atr_value * max(_safe_float(atr_multiplier), 0.0))
+        else:
+            trailing_stop = 0.0
+        peak = current_price if current_price > journal_entry else journal_entry
+        return {
+            "in_position": True,
+            "position_amount": amount,
+            "entry_price": journal_entry,
+            "peak_price": peak,
+            "trailing_stop_price": trailing_stop,
+            "trailing_profit_target": journal_entry * (1 + _safe_float(profit_target_pct)),
+            "breakeven_set": False,
+            "manage_exits": True,
+        }
+
+    return {
+        "in_position": True,
+        "position_amount": held_amount,
+        "entry_price": 0.0,
+        "peak_price": current_price,
+        "trailing_stop_price": 0.0,
+        "trailing_profit_target": 0.0,
+        "breakeven_set": False,
+        "manage_exits": False,
+    }
